@@ -9,7 +9,6 @@ const jwt = require('jsonwebtoken');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-const PRODUCTION_ORIGIN = 'https://kasir-sumberberkah.netlify.app';
 const USER_FIELDS = 'id, username, role, active, created_at, updated_at';
 let runtime;
 let initialization;
@@ -27,13 +26,21 @@ function validateEnvironment() {
   let url;
   try { url = new URL(process.env.SUPABASE_URL); } catch { throw Object.assign(new Error('SUPABASE_URL tidak valid.'), { status: 503 }); }
   if (url.protocol !== 'https:') throw Object.assign(new Error('SUPABASE_URL wajib menggunakan HTTPS.'), { status: 503 });
-  if (process.env.NODE_ENV === 'production' && process.env.CORS_ORIGIN !== PRODUCTION_ORIGIN) {
-    throw Object.assign(new Error(`CORS_ORIGIN production harus ${PRODUCTION_ORIGIN}.`), { status: 503 });
+  const configuredOrigins = process.env.CORS_ORIGIN.split(',').map(value => value.trim()).filter(Boolean);
+  for (const origin of configuredOrigins) {
+    let parsedOrigin;
+    try { parsedOrigin = new URL(origin); } catch { throw Object.assign(new Error(`CORS_ORIGIN tidak valid: ${origin}`), { status: 503 }); }
+    if (!['http:', 'https:'].includes(parsedOrigin.protocol) || parsedOrigin.origin !== origin) throw Object.assign(new Error(`CORS_ORIGIN harus berupa origin HTTP(S) tanpa path: ${origin}`), { status: 503 });
+    if (process.env.NODE_ENV === 'production' && parsedOrigin.protocol !== 'https:') throw Object.assign(new Error(`CORS_ORIGIN production wajib menggunakan HTTPS: ${origin}`), { status: 503 });
   }
+  const vercelOrigins = [process.env.VERCEL_URL, process.env.VERCEL_PROJECT_PRODUCTION_URL]
+    .map(value => String(value || '').trim().replace(/^https?:\/\//, ''))
+    .filter(Boolean)
+    .map(host => `https://${host}`);
   return {
     jwtSecret: process.env.JWT_SECRET,
     production: process.env.NODE_ENV === 'production',
-    origins: process.env.CORS_ORIGIN.split(',').map(value => value.trim()).filter(Boolean),
+    origins: [...new Set([...configuredOrigins, ...vercelOrigins])],
     supabase: createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY, { auth: { autoRefreshToken: false, persistSession: false } })
   };
 }

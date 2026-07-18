@@ -1,6 +1,6 @@
 # Web Kasir Sumber Berkah Sidoguro
 
-Aplikasi kasir statis dengan Express pada Netlify Functions, Supabase, autentikasi JWT dalam cookie HttpOnly, dan kontrol akses `ADMINISTRATOR`/`KASIR`.
+Aplikasi kasir statis dengan Express pada Vercel Functions, Supabase, autentikasi JWT dalam cookie HttpOnly, dan kontrol akses `ADMINISTRATOR`/`KASIR`.
 
 ## Pengembangan lokal
 
@@ -13,16 +13,17 @@ Aplikasi kasir statis dengan Express pada Netlify Functions, Supabase, autentika
    npm start
    ```
 
-4. Buka `http://localhost:3000`. `PORT` opsional hanya untuk server lokal dan tidak dibutuhkan Netlify Functions.
+4. Buka `http://localhost:3000`. `PORT` opsional hanya untuk server lokal dan tidak dibutuhkan Vercel Functions.
 
-## Deployment satu site Netlify
+## Deployment satu project Vercel
 
-Konfigurasi [netlify.toml](netlify.toml) menjalankan `npm run build`, memublikasikan hanya `dist`, dan membangun Function dari `netlify/functions`. Redirect `/api/*` diproses sebelum fallback frontend `/*`, sehingga API dan refresh halaman dapat berjalan pada origin yang sama.
+Konfigurasi [vercel.json](vercel.json) menjalankan `npm run build`, memublikasikan frontend dari `dist`, dan mengarahkan `/api/*` ke Express app di [api/index.js](api/index.js). Rewrite API diproses sebelum fallback SPA ke `index.html`, sehingga API dan frontend tetap berjalan pada origin yang sama.
 
 Langkah deployment:
 
 1. Buat project Supabase baru lalu jalankan seluruh [server/schema.sql](server/schema.sql) di SQL Editor. Script idempotent dan tidak berisi produk, supplier, pelanggan, transaksi, stok, user, atau password seed.
-2. Di **Netlify → Site configuration → Environment variables**, isi:
+2. Import repository ini melalui **Vercel Dashboard → Add New → Project**. Gunakan root directory repository; build command dan output directory otomatis dibaca dari `vercel.json`.
+3. Di **Vercel → Project Settings → Environment Variables**, isi untuk environment Production dan Preview:
 
    | Variabel | Nilai/ketentuan |
    | --- | --- |
@@ -30,17 +31,19 @@ Langkah deployment:
    | `SUPABASE_URL` | URL HTTPS project Supabase |
    | `SUPABASE_SECRET_KEY` | Secret/service-role key; hanya server |
    | `SUPABASE_ANON_KEY` | Publishable/anon key Supabase untuk notifikasi Realtime; aman berada di bundle frontend |
-   | `CORS_ORIGIN` | `https://kasir-sumberberkah.netlify.app` |
+   | `CORS_ORIGIN` | URL production Vercel/custom domain, misalnya `https://web-kasir-sumber-berkah.vercel.app` |
    | `INITIAL_ADMIN_USERNAME` | Misalnya `ADMIN` |
    | `INITIAL_ADMIN_PASSWORD` | Password awal kuat, minimal 8 karakter |
    | `NODE_ENV` | `production` |
 
-3. Deploy site. Build command, publish directory, dan functions directory sudah berasal dari `netlify.toml`.
-4. Uji `https://kasir-sumberberkah.netlify.app/api/health`. Respons sehat memuat `"database":"connected"`.
-5. Login dengan initial admin. Admin hanya dibuat bila username tersebut belum ada; deploy ulang tidak menggandakan admin atau mereset passwordnya.
-6. Ganti password admin melalui menu **Ganti Password** setelah login pertama.
+   Vercel otomatis memasukkan domain deployment dan production project ke daftar CORS melalui `VERCEL_URL` dan `VERCEL_PROJECT_PRODUCTION_URL`. `CORS_ORIGIN` tetap wajib diisi agar custom domain atau domain utama eksplisit diizinkan.
 
-Jangan menambahkan `PORT` ke environment Netlify. Jangan memakai anon key sebagai `SUPABASE_SECRET_KEY`; gunakan secret/service-role key dan jangan pernah memasukkannya ke frontend.
+4. Deploy project, lalu buka URL production yang diberikan Vercel.
+5. Uji `https://DOMAIN-ANDA/api/health`. Respons sehat memuat `"database":"connected"`.
+6. Login dengan initial admin. Admin hanya dibuat bila username tersebut belum ada; deploy ulang tidak menggandakan admin atau mereset passwordnya.
+7. Ganti password admin melalui menu **Ganti Password** setelah login pertama.
+
+Jangan menambahkan `PORT` ke environment Vercel. Jangan memakai anon key sebagai `SUPABASE_SECRET_KEY`; gunakan secret/service-role key dan jangan pernah memasukkannya ke frontend.
 
 ## Keamanan dan data
 
@@ -60,13 +63,14 @@ npm run check
 npm run build
 ```
 
-Build selalu membersihkan `dist`, menyalin hanya `index.html`, `assets`, dan `pages`, lalu gagal bila menemukan file/folder server, Netlify, schema, package manifest, atau `.env` di publish directory.
+Build selalu membersihkan `dist`, menyalin hanya `index.html`, `assets`, dan `pages`, lalu gagal bila menemukan function API, file server, konfigurasi Vercel, schema, package manifest, atau `.env` di publish directory.
 
 ## Struktur deployment
 
 ```text
 dist/                    # Satu-satunya publish directory (frontend)
-netlify/functions/api.js # Adapter serverless-http
+api/index.js             # Entry point Express untuk Vercel Function
+vercel.json              # Build, output directory, rewrite API, dan fallback SPA
 server/app.js            # Express app, tanpa app.listen()
 server/index.js          # Server development lokal
 server/schema.sql        # Skema Supabase idempotent

@@ -5,7 +5,7 @@ const path = require('path');
 const port = Number(process.env.PORT || 3000);
 const publishRoot = path.resolve(__dirname, '..', 'dist');
 
-// Server lokal menyajikan hasil build yang sama dengan publish directory Netlify.
+// Server lokal menyajikan hasil build yang sama dengan output directory Vercel.
 app.get(['/', '/index.html'], (_req, res) => res.sendFile(path.join(publishRoot, 'index.html')));
 app.use('/assets', express.static(path.join(publishRoot, 'assets')));
 app.use('/pages', express.static(path.join(publishRoot, 'pages')));

@@ -5,7 +5,7 @@ require('dotenv').config({ quiet: true });
 
 const root = path.resolve(__dirname, '..');
 const dist = path.join(root, 'dist');
-if (process.env.NETLIFY === 'true' && (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY)) {
+if (process.env.VERCEL === '1' && (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY)) {
   console.warn('Peringatan: SUPABASE_URL atau SUPABASE_ANON_KEY belum tersedia. Build dilanjutkan dengan polling sinkronisasi sebagai fallback.');
 }
 
@@ -27,8 +27,8 @@ fs.copyFileSync(path.join(root, 'index.html'), path.join(dist, 'index.html'));
 for (const directory of ['assets', 'pages']) fs.cpSync(path.join(root, directory), path.join(dist, directory), { recursive: true });
 fs.rmSync(path.join(dist, 'assets/js/sidebar.jsx'), { force: true });
 
-const forbiddenNames = new Set(['.env', 'schema.sql', 'package.json', 'package-lock.json']);
-const forbiddenDirectories = new Set(['server', 'netlify', 'node_modules', '.git']);
+const forbiddenNames = new Set(['.env', 'schema.sql', 'package.json', 'package-lock.json', 'vercel.json']);
+const forbiddenDirectories = new Set(['api', 'server', 'netlify', 'node_modules', '.git', '.vercel']);
 function validate(directory) {
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
     if (forbiddenNames.has(entry.name) || forbiddenDirectories.has(entry.name)) throw new Error(`Build tidak aman: ${path.relative(dist, path.join(directory, entry.name))} ditemukan di dist.`);

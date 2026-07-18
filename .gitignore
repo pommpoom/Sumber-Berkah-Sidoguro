@@ -3,7 +3,7 @@
 !.env.example
 node_modules/
 dist/
-.netlify/
+.vercel/
 *.log
 .DS_Store
 assets/js/realtime.js

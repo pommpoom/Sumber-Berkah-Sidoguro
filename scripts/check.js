@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 
 const root = path.resolve(__dirname, '..');
-for (const file of ['assets/js/app.js', 'assets/js/page-loader.js', 'server/app.js', 'server/index.js', 'netlify/functions/api.js', 'scripts/build.js', 'scripts/realtime-client.js']) {
+for (const file of ['assets/js/app.js', 'assets/js/page-loader.js', 'api/index.js', 'server/app.js', 'server/index.js', 'scripts/build.js', 'scripts/realtime-client.js']) {
   execFileSync(process.execPath, ['--check', path.join(root, file)], { stdio: 'inherit' });
 }
 const frontendFiles = ['index.html', ...fs.readdirSync(path.join(root, 'assets/js')).map(name => `assets/js/${name}`)];

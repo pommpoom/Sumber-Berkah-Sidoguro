@@ -9,7 +9,7 @@ Lihat README.md untuk:
 - menjalankan project secara lokal;
 - setup Supabase;
 - environment variables;
-- deployment Netlify;
+- deployment Vercel;
 - endpoint health API; dan
 - struktur folder project.
 
