@@ -1,0 +1,48 @@
+<section id="settingsPage" class="page">
+  <div class="section-tabs">
+    <button class="active">Pengaturan</button>
+  </div>
+  <h2>PENGATURAN</h2>
+  <form id="settingsForm" class="settings-grid">
+    <fieldset>
+      <legend>Identitas Toko</legend>
+      <label>Nama Toko<input id="setStoreName"></label>
+      <label>Alamat<textarea id="setAddress" rows="2"></textarea></label>
+      <label>WA/HP<input id="setPhone"></label>
+      <label>Email<input id="setEmail"></label>
+      <label>Kasir Default<input id="setCashier"></label>
+      <label>Metode Diskon
+        <select id="setDiscountMethod"><option>Nominal</option><option>Persen</option></select>
+      </label>
+      <label>Pajak (%)<input id="setTax" type="number" min="0" step="0.01"></label>
+    </fieldset>
+    <fieldset>
+      <legend>Bank 1</legend>
+      <label>Nama Bank<input id="setBank1Name"></label>
+      <label>No. Rekening<input id="setBank1Number"></label>
+      <label>Atas Nama<input id="setBank1Holder"></label>
+      <legend class="second-legend">Footer Struk Kasir</legend>
+      <label>Baris 1<input id="setReceiptFooter1"></label>
+      <label>Baris 2<input id="setReceiptFooter2"></label>
+      <label>Baris 3<input id="setReceiptFooter3"></label>
+    </fieldset>
+    <fieldset>
+      <legend>Bank 2</legend>
+      <label>Nama Bank<input id="setBank2Name"></label>
+      <label>No. Rekening<input id="setBank2Number"></label>
+      <label>Atas Nama<input id="setBank2Holder"></label>
+      <legend class="second-legend">Footer Invoice dan Faktur</legend>
+      <label>Baris 1<input id="setInvoiceFooter1"></label>
+      <label>Baris 2<input id="setInvoiceFooter2"></label>
+      <label>Baris 3<input id="setInvoiceFooter3"></label>
+      <label>Hormat Kami<input id="setInvoiceRegards"></label>
+    </fieldset>
+    <div class="form-buttons full-row">
+      <button class="button green" type="submit">Simpan Pengaturan</button>
+      <button class="button blue" id="backupDataBtn" type="button">Backup Data</button>
+      <button class="button outline" id="restoreDataBtn" type="button">Restore Data</button>
+      <input id="restoreDataInput" type="file" accept="application/json" class="hidden">
+      <button class="button orange" id="resetAppBtn" type="button">Reset Data ke Excel Awal</button>
+    </div>
+  </form>
+</section>

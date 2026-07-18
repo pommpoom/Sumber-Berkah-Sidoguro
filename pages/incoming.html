@@ -1,0 +1,35 @@
+<section id="incomingPage" class="page incoming-page">
+  <div class="section-tabs incoming-tabs">
+    <button data-incoming-tab="input" class="active">Input Barang Masuk</button>
+    <button data-incoming-tab="list">Daftar Barang Masuk</button>
+  </div>
+  <div id="incomingInput">
+    <div class="incoming-layout">
+      <form id="incomingForm" class="incoming-form-card">
+        <div class="incoming-form-heading"><h3>Form Input Barang Masuk</h3><small><b>*</b> Wajib diisi</small></div>
+        <div class="incoming-form-grid">
+          <label>Tanggal <b>*</b><input id="incomingDate" type="date" required><small>Tanggal barang diterima</small></label>
+          <label>Nama Supplier<select id="incomingSupplier"></select><small>Pilih supplier dari daftar</small></label>
+          <label>Nama Produk <b>*</b><select id="incomingProduct" required></select><small>Pilih produk dari daftar</small></label>
+          <label>Kategori<input id="incomingCategory" readonly placeholder="-"><small>Terisi otomatis berdasarkan produk</small></label>
+          <label>Satuan<input id="incomingUnit" readonly placeholder="-"><small>Terisi otomatis berdasarkan produk</small></label>
+          <label>Harga Beli<input id="incomingPrice" type="number" min="0" value="0" required><small>Harga beli per satuan</small></label>
+          <label>Jumlah <b>*</b><input id="incomingQty" type="number" min="0.01" step="0.01" value="0" required><small>Jumlah pembelian</small></label>
+          <label>Total<input id="incomingTotal" readonly value="0"><small>Dihitung otomatis</small></label>
+          <label class="incoming-note">Keterangan<textarea id="incomingNote" rows="3" placeholder="Catatan tambahan (opsional)..."></textarea><small>Kondisi barang, catatan pengiriman, dan lainnya</small></label>
+        </div>
+        <div class="incoming-form-actions"><button class="button blue" type="submit">Simpan Data</button><button class="button outline" id="incomingResetBtn" type="reset">Reset</button><button class="button danger-outline" id="incomingClearBtn" type="reset">Batal / Clear Form</button></div>
+      </form>
+      <aside class="incoming-side">
+        <article class="incoming-summary-card"><h3>Ringkasan Pembelian</h3><dl><dt>Supplier</dt><dd id="incomingSummarySupplier">-</dd><dt>Produk</dt><dd id="incomingSummaryProduct">-</dd><dt>Jumlah Item</dt><dd id="incomingSummaryQty">0</dd></dl><div><span>Estimasi Total</span><strong id="incomingSummaryTotal">Rp0</strong></div></article>
+      </aside>
+    </div>
+  </div>
+  <div id="incomingList" class="hidden">
+    <div class="incoming-list-card">
+      <div class="incoming-list-toolbar"><div class="incoming-search-wrap"><input id="incomingSearch" placeholder="Cari produk atau supplier..."></div><input id="incomingDateFilter" type="date" aria-label="Filter tanggal"><button class="button blue" id="exportIncomingBtn">Cetak CSV</button></div>
+      <div id="incomingSummary" class="incoming-list-stats"></div>
+      <div class="table-box incoming-list-table"><table class="excel-table"><thead><tr><th>Tanggal</th><th>Nama Supplier</th><th>Nama Produk</th><th>Kategori</th><th>Satuan</th><th>Harga Beli</th><th>Jumlah</th><th>Total</th><th>Aksi</th></tr></thead><tbody id="incomingTableBody"></tbody></table></div>
+    </div>
+  </div>
+</section>

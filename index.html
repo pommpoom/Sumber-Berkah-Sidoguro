@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Aplikasi kasir, stok dan pencatatan transaksi Sumber Berkah Sidoguro">
+  <link rel="icon" href="assets/images/logo-sbs.svg">
+  <title>Sumber Berkah Sidoguro</title>
+  <link rel="stylesheet" href="assets/css/main.css?v=20260717-19">
+</head>
+<body class="session-checking">
+  <div id="loginScreen" class="login-screen">
+    <div class="session-loader" role="status" aria-live="polite"><span></span><b>Memulihkan sesi…</b></div>
+    <form id="loginForm" class="login-card">
+      <div class="excel-logo"><img src="assets/images/logo-sbs.svg" alt="Logo Sumber Berkah"></div>
+      <label>Username
+        <input id="loginUsername" autocomplete="username" required>
+      </label>
+      <label>Password
+        <input id="loginPassword" type="password" autocomplete="current-password" required>
+      </label>
+      <button class="button blue wide" type="submit">Login</button>
+    </form>
+  </div>
+
+  <div id="app" class="app hidden">
+    <header class="excel-header">
+      <div class="workbook-bar">
+        <div class="workbook-title">
+          <span class="excel-icon"><img src="assets/images/logo-sbs.svg" alt="Logo Sumber Berkah"></span>
+          <span class="brand-copy"><strong id="workbookName">SUMBER BERKAH</strong></span>
+        </div>
+        <div class="user-info"><span class="online-dot"></span> Kasir aktif: <b id="activeUser">SBS</b></div>
+      </div>
+
+      <nav id="topNav" class="top-nav">
+      </nav>
+    </header>
+
+    <main>
+      <div class="content-topbar">
+        <div class="topbar-left">
+          <button id="sidebarToggle" class="sidebar-toggle" type="button" aria-label="Sembunyikan navigasi" aria-expanded="true">☰</button>
+          <div class="breadcrumb"><span id="breadcrumbLabel">Transaksi Kasir</span></div>
+        </div>
+      </div>
+      <div class="page-heading">
+        <span id="pageHeadingIcon" class="page-heading-icon">🛒</span>
+        <div><h1 id="pageHeadingTitle">TRANSAKSI KASIR</h1><p id="pageHeadingDescription">Kelola transaksi penjualan toko</p></div>
+      </div>
+      <div id="pageContainer" aria-live="polite"></div>
+    </main>
+    <button id="sidebarBackdrop" class="sidebar-backdrop" type="button" aria-label="Tutup navigasi"></button>
+  </div>
+
+  <div id="modal" class="modal">
+    <div class="modal-card">
+      <div class="modal-header"><h3 id="modalTitle"></h3><button id="modalClose">×</button></div>
+      <div id="modalBody"></div>
+    </div>
+  </div>
+  <div id="toast" class="toast"></div>
+
+  <script src="assets/js/sidebar.js?v=20260717-5"></script>
+  <script src="assets/js/page-loader.js?v=20260717-19"></script>
+</body>
+</html>

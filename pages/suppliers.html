@@ -1,0 +1,21 @@
+<section id="suppliersPage" class="page supplier-page">
+  <div class="supplier-toolbar">
+    <div class="supplier-search-wrap"><span>⌕</span><input id="supplierSearch" placeholder="Cari supplier, alamat, atau nomor HP..."></div>
+    <button class="button green" id="addSupplierBtn">＋ Tambah Supplier</button>
+    <button class="button outline" id="exportSuppliersBtn">⇩ Export CSV</button>
+  </div>
+
+  <div class="supplier-content-grid">
+    <div class="supplier-list-card">
+      <div class="table-box supplier-table-box">
+        <table class="excel-table supplier-table">
+          <thead><tr><th>Nama Supplier</th><th>Alamat</th><th>Telepon / HP</th><th>Email</th><th>Keterangan</th></tr></thead>
+          <tbody id="supplierTableBody"></tbody>
+        </table>
+      </div>
+      <div class="supplier-list-footer"><span id="supplierRecordInfo"></span><span>Data supplier tersimpan di server</span></div>
+    </div>
+
+    <aside id="supplierDetail" class="supplier-detail-card"></aside>
+  </div>
+</section>

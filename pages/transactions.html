@@ -1,0 +1,19 @@
+<section id="transactionsPage" class="page transactions-page">
+  <article class="transactions-card">
+    <div class="transactions-toolbar">
+      <span id="transactionRecordCount" class="transaction-record-count"></span>
+      <div class="transaction-search"><input id="transactionSearch" placeholder="Cari no. transaksi / pelanggan..."><span>⌕</span></div>
+      <input id="transactionDateFilter" type="date" aria-label="Filter tanggal">
+      <select id="transactionPaymentFilter" aria-label="Filter metode bayar"></select>
+      <button class="button outline" id="refreshTransactionsBtn">↻ Refresh</button>
+      <button class="button blue" id="exportTransactionsBtn">⇩ Export CSV</button>
+    </div>
+    <div class="table-box transactions-table-box">
+      <table class="excel-table transactions-table">
+        <thead><tr><th>No. Transaksi</th><th>Tgl. Transaksi</th><th>Kasir</th><th>Pengantar</th><th>Pelanggan</th><th>Metode Bayar</th><th>Jumlah Item</th><th>Subtotal</th><th>Diskon %</th><th>Diskon</th><th>Pajak %</th><th>Pajak</th><th>Total</th><th>Bayar</th><th>Kembali</th><th>DP</th><th>Sisa</th><th>Status</th><th>Aksi</th></tr></thead>
+        <tbody id="transactionTableBody"></tbody>
+      </table>
+    </div>
+    <div class="transactions-footer"><span id="transactionPageInfo"></span><div id="transactionPagination" class="transaction-pagination"></div></div>
+  </article>
+</section>

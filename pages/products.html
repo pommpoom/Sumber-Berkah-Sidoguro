@@ -1,0 +1,16 @@
+<section id="productsPage" class="page products-page">
+  <div class="products-toolbar-card">
+    <div class="product-search-wrap"><input id="productSearch" placeholder="Cari produk..."></div>
+    <select id="productCategoryFilter" aria-label="Filter kategori"></select>
+    <select id="productStockFilter" aria-label="Filter status stok"><option value="">Semua Status Stok</option><option value="available">Stok Tersedia</option><option value="low">Stok Menipis</option><option value="empty">Stok Habis</option></select>
+    <span class="products-toolbar-spacer"></span>
+    <button class="button blue" id="addProductBtn">Tambah Produk</button>
+    <button class="button outline" id="exportProductsBtn">Cetak CSV</button>
+  </div>
+  <div class="product-stats" id="productSummary"></div>
+  <article class="products-table-card">
+    <div class="products-table-title"><b>Daftar Produk</b><span id="productRecordCount"></span></div>
+    <div class="table-box products-table-box"><table class="excel-table products-table"><thead><tr><th>Nama Produk</th><th>Kategori</th><th>Satuan</th><th>Hitung Stok</th><th>Harga Modal</th><th>Harga Jual Satuan</th><th>Harga Jual Grosir</th><th>Diskon</th><th>Stok</th><th>Harga Modal Stok</th><th>Aksi</th></tr></thead><tbody id="productTableBody"></tbody></table></div>
+    <div class="products-footer"><span id="productPageInfo"></span><div id="productPagination" class="transaction-pagination"></div></div>
+  </article>
+</section>

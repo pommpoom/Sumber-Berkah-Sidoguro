@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+.netlify/
+*.log
+.DS_Store
+assets/js/realtime.js

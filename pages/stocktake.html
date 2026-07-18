@@ -1,0 +1,34 @@
+<section id="stocktakePage" class="page stocktake-page">
+  <div class="section-tabs incoming-tabs">
+    <button data-stock-tab="input" class="active">Input Stok Opname</button>
+    <button data-stock-tab="list">Daftar Stok Opname</button>
+  </div>
+  <div id="stockInput">
+    <div class="incoming-layout">
+      <form id="stocktakeForm" class="incoming-form-card">
+        <div class="incoming-form-heading"><h3>Form Input Stok Opname</h3><small><b>*</b> Wajib diisi</small></div>
+        <div class="incoming-form-grid stocktake-form-grid">
+          <label>Tanggal <b>*</b><input id="stockDate" type="date" required><small>Tanggal pemeriksaan stok</small></label>
+          <label>Nama Produk <b>*</b><select id="stockProduct" required></select><small>Pilih produk yang diperiksa</small></label>
+          <label>Kategori<input id="stockCategory" readonly placeholder="-"><small>Terisi otomatis berdasarkan produk</small></label>
+          <label>Satuan<input id="stockUnit" readonly placeholder="-"><small>Terisi otomatis berdasarkan produk</small></label>
+          <label>Stok Sistem<input id="stockSystem" readonly value="0"><small>Stok yang tercatat dalam sistem</small></label>
+          <label>Stok Fisik <b>*</b><input id="stockPhysical" type="number" min="0" step="0.01" value="0" required><small>Jumlah stok hasil pemeriksaan</small></label>
+          <label>Selisih<input id="stockDifference" readonly value="0"><small>Stok fisik dikurangi stok sistem</small></label>
+          <label class="incoming-note">Keterangan<textarea id="stockNote" rows="3" placeholder="Catatan hasil stok opname (opsional)..."></textarea><small>Kondisi barang atau alasan perbedaan stok</small></label>
+        </div>
+        <div class="incoming-form-actions"><button class="button blue" type="submit">Simpan Data</button><button class="button outline" type="reset">Reset</button><button class="button danger-outline" type="reset">Batal / Clear Form</button></div>
+      </form>
+      <aside class="incoming-side">
+        <article class="incoming-summary-card"><h3>Ringkasan Stok</h3><dl><dt>Produk</dt><dd id="stockSummaryProduct">-</dd><dt>Stok Sistem</dt><dd id="stockSummarySystem">0</dd><dt>Stok Fisik</dt><dd id="stockSummaryPhysical">0</dd></dl><div><span>Selisih Stok</span><strong id="stockSummaryDifference">0</strong></div></article>
+      </aside>
+    </div>
+  </div>
+  <div id="stockList" class="hidden">
+    <div class="incoming-list-card">
+      <div class="incoming-list-toolbar"><div class="incoming-search-wrap"><input id="stockSearch" placeholder="Cari produk atau kategori..."></div><input id="stockDateFilter" type="date" aria-label="Filter tanggal"></div>
+      <div id="stocktakeSummary" class="incoming-list-stats"></div>
+      <div class="table-box incoming-list-table"><table class="excel-table"><thead><tr><th>Tanggal</th><th>Nama Produk</th><th>Kategori</th><th>Satuan</th><th>Stok Sistem</th><th>Stok Fisik</th><th>Selisih</th><th>Keterangan</th><th>Aksi</th></tr></thead><tbody id="stocktakeTableBody"></tbody></table></div>
+    </div>
+  </div>
+</section>

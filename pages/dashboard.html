@@ -1,0 +1,15 @@
+<section id="dashboardPage" class="page dashboard-page">
+  <div class="dashboard-title-row"><label class="dashboard-date"><input id="dashboardDate" type="date"></label></div>
+  <div id="dashboardKpis" class="dashboard-kpis"></div>
+  <div class="dashboard-main-grid">
+    <article class="dashboard-widget dashboard-chart-widget"><header><b>Grafik Penjualan 7 Hari</b><span>Penjualan dan laba kotor</span></header><div id="dashboardChart" class="dashboard-chart"></div></article>
+    <article class="dashboard-widget"><header><b>Stok Habis &amp; Menipis</b><button data-page="products">Lihat Semua</button></header><div id="dashboardStockIssues" class="dashboard-widget-body"></div></article>
+    <article class="dashboard-widget"><header><b>Transaksi Terbaru</b><button data-page="transactions">Lihat Semua</button></header><div id="dashboardRecentTransactions" class="dashboard-widget-body"></div></article>
+    <article class="dashboard-widget"><header><b>Produk Terlaris</b><span>Hari terpilih</span></header><div id="dashboardTopProducts" class="dashboard-widget-body"></div></article>
+  </div>
+  <div class="dashboard-bottom-grid">
+    <article class="dashboard-widget"><header><b>Ringkasan Pembelian Bulan Ini</b></header><div id="dashboardPurchases" class="dashboard-widget-body"></div></article>
+    <article class="dashboard-widget"><header><b>Notifikasi Penting</b></header><div id="dashboardNotifications" class="dashboard-widget-body"></div></article>
+    <article class="dashboard-widget"><header><b>Aksi Cepat</b></header><div class="dashboard-quick-actions"><button data-page="cashier">Transaksi Baru</button><button data-page="incoming">Input Barang Masuk</button><button data-dashboard-add-product>Tambah Produk</button><button data-page="stocktake">Stok Opname</button></div></article>
+  </div>
+</section>

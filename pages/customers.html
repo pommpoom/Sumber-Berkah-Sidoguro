@@ -1,0 +1,14 @@
+<section id="customersPage" class="page customers-page">
+  <div class="customers-toolbar-card">
+    <div class="customer-search-wrap"><input id="customerSearch" placeholder="Cari pelanggan..."></div>
+    <select id="customerRegionFilter" aria-label="Filter wilayah"></select>
+    <span class="customers-toolbar-spacer"></span>
+    <button class="button blue" id="addCustomerBtn">Tambah Pelanggan</button>
+    <button class="button outline" id="exportCustomersBtn">Cetak CSV</button>
+  </div>
+  <article class="customers-table-card">
+    <div class="customers-table-title"><b>Daftar Pelanggan</b><span id="customerRecordCount"></span></div>
+    <div class="table-box customers-table-box"><table class="excel-table customers-table"><thead><tr><th>Nama Pelanggan</th><th>Alamat</th><th>No. HP / WA</th><th>Email</th><th>Keterangan</th><th>Aksi</th></tr></thead><tbody id="customerTableBody"></tbody></table></div>
+    <div class="customers-footer"><span id="customerPageInfo"></span><div id="customerPagination" class="transaction-pagination"></div></div>
+  </article>
+</section>

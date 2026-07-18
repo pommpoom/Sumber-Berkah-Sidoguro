@@ -1,0 +1,64 @@
+<section id="cashierPage" class="page cashier-page">
+  <div class="cashier-workspace">
+    <div class="cashier-main-column">
+      <div class="cashier-top-cards">
+        <article class="cashier-brand-card">
+          <img class="cashier-shop-logo" src="assets/images/logo-sbs.svg" alt="Logo Sumber Berkah">
+          <div class="cashier-shop-info">
+            <h1 id="cashierStoreName">SUMBER BERKAH SIDOGURO</h1>
+            <p><span id="cashierAddress"></span></p>
+            <p><span id="cashierPhone"></span></p>
+            <p>Kasir: <b id="cashierName"></b></p>
+          </div>
+          <img class="cashier-watermark" src="assets/images/logo-sbs.svg" alt="" aria-hidden="true">
+        </article>
+
+        <article class="cashier-summary-card">
+          <h3>RINGKASAN TRANSAKSI</h3>
+          <div><span>Subtotal</span><strong class="cash-value"><i>Rp</i><b id="cashSubtotal">0</b></strong></div>
+          <div><span id="cashDiscountLabel">Diskon</span><label class="cash-value"><i id="cashDiscountPrefix">Rp</i><input id="cashDiscount" type="number" value="0" min="0"></label></div>
+          <div><span>Pajak</span><strong class="cash-value"><i>Rp</i><b id="cashTax">0</b></strong></div>
+          <div class="cashier-total"><span>Total</span><strong class="cash-value"><i>Rp</i><b id="cashTotal">0</b></strong></div>
+          <div><span id="cashPaymentLabel">Tunai</span><label class="cash-value"><i>Rp</i><input id="cashPayment" type="number" value="0" min="0"></label></div>
+          <div class="cashier-change"><span id="cashChangeLabel">Kembalian</span><strong class="cash-value"><i>Rp</i><b id="cashChange">0</b></strong></div>
+          <div id="cashRemainingRow" class="cashier-change hidden"><span>Sisa Pembayaran</span><strong class="cash-value"><i>Rp</i><b id="cashRemaining">0</b></strong></div>
+        </article>
+      </div>
+
+      <article class="cashier-cart-card">
+        <h3>KERANJANG / DAFTAR PRODUK</h3>
+        <div class="cash-actions">
+          <button class="button cart-cancel" id="cancelCashierBtn">Batal</button>
+          <button class="button cart-save" id="saveTransactionBtn">Simpan Data</button>
+          <button class="button cart-print" id="printCashierReceiptBtn">Cetak Nota 58 mm</button>
+          <button class="button cart-pdf" id="saveCashierPdfBtn">Simpan PDF</button>
+        </div>
+        <div class="table-box cashier-cart-box">
+          <table class="excel-table blue-head">
+            <thead><tr><th>No.</th><th>Nama Produk</th><th>Harga</th><th>Diskon/Item</th><th>Qty</th><th>Satuan</th><th>Jumlah</th><th>Aksi</th></tr></thead>
+            <tbody id="cashierCartBody"></tbody>
+          </table>
+        </div>
+      </article>
+    </div>
+
+    <aside class="cashier-entry">
+      <h3>INPUT TRANSAKSI</h3>
+      <div class="transaction-meta">
+        <label>No. Transaksi<input id="cashInvoice" readonly></label>
+        <label>Tanggal / Jam<input id="cashDateTime" readonly></label>
+        <label>Pengantar<input id="cashCourier" placeholder="Masukkan pengantar (opsional)"></label>
+        <label>Pelanggan<span class="quick-entry-control"><input id="cashCustomer" list="cashCustomerOptions" placeholder="Ketik atau pilih pelanggan" autocomplete="off"><button class="quick-add-button" id="quickAddCustomerBtn" type="button">+ Tambah</button></span><datalist id="cashCustomerOptions"></datalist></label>
+        <label>Metode Bayar<select id="cashPaymentMethod"></select></label>
+      </div>
+      <hr>
+      <label>Nama Produk<span class="quick-entry-control"><input id="cashProduct" list="cashProductOptions" placeholder="Ketik untuk mencari produk" autocomplete="off"><button class="quick-add-button" id="quickAddProductBtn" type="button">+ Tambah</button></span><datalist id="cashProductOptions"></datalist></label>
+      <label>Type Harga<select id="cashPriceType"><option value="wholesale">Harga Jual Grosir</option><option value="retail">Harga Jual Satuan</option></select></label>
+      <label>Harga<input id="cashPrice" type="number" min="0"></label>
+      <label>Diskon<input id="cashItemDiscount" type="number" value="0" min="0"></label>
+      <label>Banyaknya<input id="cashQty" type="number" value="1" min="0.01" step="0.01"></label>
+      <label>Jumlah<input id="cashLineTotal" readonly></label>
+      <button class="button blue wide add-cart-button" id="addCartItemBtn">Tambah</button>
+    </aside>
+  </div>
+</section>

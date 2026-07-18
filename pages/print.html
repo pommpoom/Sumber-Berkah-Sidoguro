@@ -1,0 +1,15 @@
+<section id="printPage" class="page print-page">
+  <div class="print-search-card">
+    <label>No. Transaksi<input id="printInvoiceSearch" placeholder="Masukkan nomor transaksi"></label>
+    <label>Jenis Nota
+      <select id="printReceiptType"><option>Struk Kasir Ukuran 58 mm</option><option>Invoice A4</option><option>Faktur Penjualan A4</option></select>
+    </label>
+    <label>Metode Cetak
+      <select id="printMethod"><option>Dialog Printer</option><option>Tidak Mencetak</option></select>
+    </label>
+    <button class="button blue" id="findPrintInvoiceBtn" type="button">Cari</button>
+    <button class="button green" id="printSelectedBtn" type="button">Cetak Sesuai Pilihan</button>
+  </div>
+  <p class="print-help">Untuk printer thermal, pilih Paper size 58 mm, Margins None, Scale 100%, dan matikan Headers and footers.</p>
+  <div id="printPreviews" class="print-previews"></div>
+</section>
