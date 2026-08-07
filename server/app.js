@@ -133,6 +133,7 @@ function mergeCashierState(current, submitted, currentUserName) {
   merged.stocktakes = current.stocktakes;
   const oldProducts = new Map((current.products || []).map(product => [product.id, product]));
   const oldTransactions = new Map((current.transactions || []).map(transaction => [transaction.id || transaction.invoice, transaction]));
+  const submittedTransactions = new Map((submitted.transactions || []).map(transaction => [transaction.id || transaction.invoice, transaction]));
   const additions = (submitted.transactions || []).filter(transaction => !oldTransactions.has(transaction.id || transaction.invoice)).map(transaction => {
     const items = (transaction.items || []).map(item => {
       const product = oldProducts.get(item.productId);
@@ -141,7 +142,30 @@ function mergeCashierState(current, submitted, currentUserName) {
     });
     return { ...transaction, cashier: currentUserName, items };
   });
-  merged.transactions = [...additions, ...(current.transactions || [])];
+  const updatedExisting = (current.transactions || []).map(transaction => {
+    const submittedTransaction = submittedTransactions.get(transaction.id || transaction.invoice);
+    if (!submittedTransaction || Number(transaction.remaining || 0) <= 0) return transaction;
+    const existingPayments = Array.isArray(transaction.paymentHistory) ? transaction.paymentHistory : [];
+    const existingIds = new Set(existingPayments.map(payment => String(payment.id || '')));
+    let remaining = Math.max(0, Number(transaction.remaining || 0));
+    const acceptedPayments = [];
+    for (const payment of Array.isArray(submittedTransaction.paymentHistory) ? submittedTransaction.paymentHistory : []) {
+      if (!payment || existingIds.has(String(payment.id || '')) || remaining <= 0) continue;
+      const amount = Math.min(remaining, Math.max(0, Number(payment.amount || 0)));
+      const date = String(payment.date || '').slice(0, 10);
+      const method = String(payment.method || '').trim();
+      if (!amount || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !method) continue;
+      acceptedPayments.push({ id: String(payment.id || `${transaction.invoice}-PAY-${Date.now()}-${acceptedPayments.length}`), date, method, amount, createdAt: payment.createdAt || new Date().toISOString(), cashier: currentUserName, note: String(payment.note || '').trim() });
+      remaining -= amount;
+    }
+    if (!acceptedPayments.length) return transaction;
+    const paymentHistory = [...existingPayments, ...acceptedPayments];
+    const settlementTotal = paymentHistory.reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
+    const total = Number(transaction.total || 0);
+    const paid = Math.min(total, Number(transaction.downPayment || 0) + settlementTotal);
+    return { ...transaction, paymentHistory, payment: paid, cashIn: transaction.paymentMethod === 'DP' ? Number(transaction.downPayment || 0) : paid, remaining: Math.max(0, total - paid), paymentStatus: paid >= total ? 'LUNAS' : 'BELUM LUNAS' };
+  });
+  merged.transactions = [...additions, ...updatedExisting];
   const soldByProduct = new Map();
   additions.forEach(transaction => transaction.items.forEach(item => soldByProduct.set(item.productId, (soldByProduct.get(item.productId) || 0) + Math.max(0, Number(item.qty || 0)))));
   merged.products = (current.products || []).map(product => ({ ...product, stock: Math.max(0, Number(product.stock || 0) - (soldByProduct.get(product.id) || 0)) }));

@@ -69,7 +69,21 @@ async function loadUsers(){if(currentUser()?.level!=="ADMINISTRATOR")return;user
 
 function calculateItemAmount(price,discount,qty){return Math.max(0,(Number(price)||0)-Math.max(0,Number(discount)||0))*Math.max(0,Number(qty)||0)}
 function calculateItemNetPrice(price,discount){return calculateItemAmount(price,discount,1)}
-function getTransactionCashIn(transaction){return Number((transaction.cashIn??(transaction.paymentMethod==="DP"?transaction.downPayment:transaction.total))||0)}
+function transactionSettlementTotal(transaction){return (transaction.paymentHistory||[]).reduce((sum,payment)=>sum+Number(payment.amount||0),0)}
+function getTransactionPaidTotal(transaction){return Math.min(Number(transaction.total||0),Number(transaction.paymentMethod==="DP"?transaction.downPayment||0:transaction.payment||transaction.cashIn||transaction.total||0)+transactionSettlementTotal(transaction))}
+function getInitialTransactionCashIn(transaction){return Number((transaction.cashIn??(transaction.paymentMethod==="DP"?transaction.downPayment:transaction.total))||0)}
+function getTransactionCashIn(transaction){return getTransactionPaidTotal(transaction)}
+function getTransactionCashInOnDate(transaction,date){
+  const initialDate=String(transaction.createdAt||"").slice(0,10);
+  const initial=initialDate===date?getInitialTransactionCashIn(transaction):0;
+  return initial+(transaction.paymentHistory||[]).filter(payment=>payment.date===date).reduce((sum,payment)=>sum+Number(payment.amount||0),0);
+}
+function getTransactionPaymentsOnDate(transaction,date){
+  const rows=[];
+  if(String(transaction.createdAt||"").slice(0,10)===date)rows.push({method:transaction.paymentMethod||"-",amount:getInitialTransactionCashIn(transaction)});
+  (transaction.paymentHistory||[]).filter(payment=>payment.date===date).forEach(payment=>rows.push({method:payment.method||"Pelunasan",amount:Number(payment.amount||0)}));
+  return rows;
+}
 function getPaymentStatus(transaction){return Number(transaction.remaining||0)>0?"BELUM LUNAS":"LUNAS"}
 function normalizeTransaction(transaction){
   const t={...transaction};
@@ -85,8 +99,10 @@ function normalizeTransaction(transaction){
   t.taxPercent=toSafeNumber(t.taxPercent); t.taxAmount=toSafeNumber(t.taxAmount??Math.max(0,t.subtotal-t.discountAmount)*t.taxPercent/100);
   t.total=toSafeNumber(t.total??(t.subtotal-t.discountAmount+t.taxAmount));
   t.downPayment=Math.max(0,toSafeNumber(t.downPayment)); t.payment=toSafeNumber(t.payment); t.change=Math.max(0,toSafeNumber(t.change));
-  t.remaining=Math.max(0,toSafeNumber(t.remaining??(t.paymentMethod==="DP"?t.total-t.downPayment:0)));
-  t.cashIn=getTransactionCashIn(t); t.paymentStatus=getPaymentStatus(t);
+  t.paymentHistory=Array.isArray(t.paymentHistory)?t.paymentHistory.map((payment,index)=>({id:payment.id||`${t.invoice||t.id||"TX"}-PAY-${index+1}`,date:String(payment.date||payment.createdAt||today()).slice(0,10),method:payment.method||"Tunai",amount:Math.max(0,toSafeNumber(payment.amount)),createdAt:payment.createdAt||new Date().toISOString(),cashier:payment.cashier||"",note:payment.note||""})).filter(payment=>payment.amount>0):[];
+  if(t.paymentMethod==="DP")t.payment=getTransactionPaidTotal(t);
+  t.remaining=Math.max(0,t.paymentMethod==="DP"?t.total-getTransactionPaidTotal(t):toSafeNumber(t.remaining??0));
+  t.cashIn=t.paymentMethod==="DP"?t.downPayment:getTransactionPaidTotal(t); t.paymentStatus=getPaymentStatus(t);
   return t;
 }
 function normalizeState(raw){
@@ -367,18 +383,18 @@ function renderSettings(){
 
 function renderDashboard(){
   if(!$("#dashboardDate").value)$("#dashboardDate").value=today();const selectedDate=$("#dashboardDate").value;
-  const daily=state.transactions.filter(t=>String(t.createdAt||"").slice(0,10)===selectedDate),sales=daily.reduce((s,t)=>s+Number(t.total||0),0),profit=daily.reduce((s,t)=>s+t.items.reduce((a,i)=>a+Number(i.profit||0),0),0),moneyIn=daily.reduce((s,t)=>s+getTransactionCashIn(t),0),receivable=daily.reduce((s,t)=>s+Number(t.remaining||0),0);
-  const lowStocks=state.products.filter(p=>p.trackStock&&Number(p.stock||0)<=Number(p.minStock||0)),emptyStocks=lowStocks.filter(p=>Number(p.stock||0)<=0);
-  const payments=daily.reduce((m,t)=>{m[t.paymentMethod]=(m[t.paymentMethod]||0)+getTransactionCashIn(t);return m},{});
-  $("#dashboardKpis").innerHTML=`<article><div><small>Penjualan Hari Ini</small><strong>${rupiah(sales)}</strong><p>${daily.length} transaksi</p></div></article>${hasPermission("dashboard-profit")?`<article class="green"><div><small>Laba Kotor Hari Ini</small><strong>${rupiah(profit)}</strong><p>${sales?((profit/sales)*100).toFixed(1):0}% dari penjualan</p></div></article>`:""}<article class="purple"><div><small>Uang Masuk Hari Ini</small><strong>${rupiah(moneyIn)}</strong><p>${Object.entries(payments).map(([k,v])=>`${esc(k)}: ${rupiah(v)}`).join(", ")||"Belum ada pembayaran"}</p></div></article><article class="orange"><div><small>Stok Bermasalah</small><strong>${lowStocks.length}</strong><p>${emptyStocks.length} habis, ${lowStocks.length-emptyStocks.length} menipis</p></div></article><article class="cyan"><div><small>Piutang / Sisa</small><strong>${rupiah(receivable)}</strong><p>${daily.filter(t=>t.paymentStatus==="BELUM LUNAS").length} transaksi belum lunas</p></div></article>`;
+  const daily=state.transactions.filter(t=>String(t.createdAt||"").slice(0,10)===selectedDate),sales=daily.reduce((s,t)=>s+Number(t.total||0),0),profit=daily.reduce((s,t)=>s+t.items.reduce((a,i)=>a+Number(i.profit||0),0),0),moneyIn=state.transactions.reduce((s,t)=>s+getTransactionCashInOnDate(t,selectedDate),0),receivable=state.transactions.reduce((s,t)=>s+Number(t.remaining||0),0);
+  const lowStocks=state.products.filter(p=>p.trackStock&&Number(p.stock||0)<=Number(p.minStock||0)),emptyStocks=lowStocks.filter(p=>Number(p.stock||0)<=0),unpaid=state.transactions.filter(t=>t.paymentStatus==="BELUM LUNAS");
+  const payments=state.transactions.reduce((m,t)=>{getTransactionPaymentsOnDate(t,selectedDate).forEach(payment=>{m[payment.method]=(m[payment.method]||0)+payment.amount});return m},{});
+  $("#dashboardKpis").innerHTML=`<article><div><small>Penjualan Hari Ini</small><strong>${rupiah(sales)}</strong><p>${daily.length} transaksi</p></div></article>${hasPermission("dashboard-profit")?`<article class="green"><div><small>Laba Kotor Hari Ini</small><strong>${rupiah(profit)}</strong><p>${sales?((profit/sales)*100).toFixed(1):0}% dari penjualan</p></div></article>`:""}<article class="purple"><div><small>Uang Masuk Hari Ini</small><strong>${rupiah(moneyIn)}</strong><p>${Object.entries(payments).map(([k,v])=>`${esc(k)}: ${rupiah(v)}`).join(", ")||"Belum ada pembayaran"}</p></div></article><article class="orange"><div><small>Stok Bermasalah</small><strong>${lowStocks.length}</strong><p>${emptyStocks.length} habis, ${lowStocks.length-emptyStocks.length} menipis</p></div></article><article class="cyan"><div><small>Piutang / Sisa</small><strong>${rupiah(receivable)}</strong><p>${unpaid.length} transaksi belum lunas</p></div></article>`;
   const days=[];for(let i=6;i>=0;i--){const d=new Date(selectedDate+"T00:00:00");d.setDate(d.getDate()-i);const key=d.toISOString().slice(0,10),tx=state.transactions.filter(t=>String(t.createdAt||"").slice(0,10)===key);days.push({label:key.slice(8,10)+"/"+key.slice(5,7),sales:tx.reduce((s,t)=>s+Number(t.total||0),0),profit:tx.reduce((s,t)=>s+t.items.reduce((a,x)=>a+Number(x.profit||0),0),0)})}const max=Math.max(...days.map(x=>x.sales),1);
   $("#dashboardChart").innerHTML=`<div class="chart-legend"><span class="sales-legend">Penjualan</span><span class="profit-legend">Laba Kotor</span></div><div class="chart-bars">${days.map(x=>`<div><span class="sales-bar" style="height:${Math.max(3,x.sales/max*150)}px"></span><span class="profit-bar" style="height:${Math.max(2,x.profit/max*150)}px"></span><small>${x.label}</small><b>${x.sales?rupiah(x.sales):"Rp0"}</b></div>`).join("")}</div>`;
   $("#dashboardStockIssues").innerHTML=lowStocks.slice(0,8).map(p=>`<div class="dashboard-data-row"><span><b>${esc(p.name)}</b><small>Minimum ${money(p.minStock)} ${esc(p.unit)}</small></span><strong class="${p.stock<=0?"negative":""}">${money(p.stock)} ${esc(p.unit)}</strong></div>`).join("")||`<p class="dashboard-empty">Semua stok masih aman.</p>`;
   $("#dashboardRecentTransactions").innerHTML=daily.slice(0,6).map(t=>`<div class="dashboard-data-row"><span><b>${esc(t.invoice)}</b><small>${esc(t.customer||"UMUM")} · ${esc(t.paymentMethod)}</small></span><strong>${rupiah(t.total)}</strong></div>`).join("")||`<p class="dashboard-empty">Belum ada transaksi pada tanggal ini.</p>`;
   const productSales={};daily.forEach(t=>t.items.forEach(i=>{const x=productSales[i.productId]||(productSales[i.productId]={name:i.name,qty:0,revenue:0,profit:0});x.qty+=Number(i.qty||0);x.revenue+=Number(i.amount||0);x.profit+=Number(i.profit||0)}));const topProducts=Object.values(productSales).sort((a,b)=>b.qty-a.qty).slice(0,6);
   $("#dashboardTopProducts").innerHTML=topProducts.map((x,i)=>`<div class="dashboard-data-row ranked"><i>${i+1}</i><span><b>${esc(x.name)}</b><small>${money(x.qty)} terjual</small></span><strong>${rupiah(x.revenue)}</strong></div>`).join("")||`<p class="dashboard-empty">Belum ada produk terjual.</p>`;
-  const unpaid=state.transactions.filter(t=>t.paymentStatus==="BELUM LUNAS"), allReceivable=unpaid.reduce((sum,t)=>sum+Number(t.remaining||0),0);
-  $("#dashboardNotifications").innerHTML=`<p class="critical">${emptyStocks.length} produk stok habis</p><p class="warning">${lowStocks.length-emptyStocks.length} produk stok menipis</p><p class="warning">${unpaid.length} transaksi belum lunas · ${rupiah(allReceivable)}</p>${state.lastBackupAt?`<p class="success">Backup terakhir: ${formatDateTime(state.lastBackupAt)}</p>`:""}`;
+  const allReceivable=unpaid.reduce((sum,t)=>sum+Number(t.remaining||0),0);
+  $("#dashboardNotifications").innerHTML=`<p class="critical">${emptyStocks.length} produk stok habis</p><p class="warning">${lowStocks.length-emptyStocks.length} produk stok menipis</p>${unpaid.length?`<p class="warning">${unpaid.length} transaksi belum lunas · ${rupiah(allReceivable)}</p>`:`<p class="success">Semua transaksi sudah lunas</p>`}${state.lastBackupAt?`<p class="success">Backup terakhir: ${formatDateTime(state.lastBackupAt)}</p>`:""}`;
 }
 function saveSettings(e){
   if(!requirePermission("settings")){e.preventDefault();return}
@@ -662,12 +678,14 @@ function renderTransactions(){
   fillSelect($("#transactionPaymentFilter"),state.paymentMethods,x=>x,x=>x,true,"Semua Metode Bayar");
   const q=$("#transactionSearch").value.toLowerCase(), date=$("#transactionDateFilter").value, payment=$("#transactionPaymentFilter").value;
   const rows=state.transactions.filter(t=>(t.invoice+" "+t.customer).toLowerCase().includes(q)&&(!date||t.createdAt.slice(0,10)===date)&&(!payment||t.paymentMethod===payment));
+  const unpaid=state.transactions.filter(t=>Number(t.remaining||0)>0);
+  $("#transactionUnpaidPanel").innerHTML=unpaid.length?`<div><b>${unpaid.length} transaksi belum lunas</b><span>Total sisa piutang ${rupiah(unpaid.reduce((sum,t)=>sum+Number(t.remaining||0),0))}</span></div><div>${unpaid.slice(0,5).map(t=>`<button class="mini-btn settle" data-tx-settle="${esc(t.invoice)}">${esc(t.invoice)} · ${rupiah(t.remaining)}</button>`).join("")}</div>`:`<div><b>Semua transaksi sudah lunas</b><span>Tidak ada piutang DP yang perlu ditagih.</span></div>`;
   const pageSize=10,pageCount=Math.max(1,Math.ceil(rows.length/pageSize));
   transactionPage=Math.min(Math.max(transactionPage,1),pageCount);
   const start=(transactionPage-1)*pageSize,pagedRows=rows.slice(start,start+pageSize);
   $("#transactionRecordCount").innerHTML=`Total Record: <b>${rows.length}</b>`;
   $("#transactionPageInfo").textContent=rows.length?`Menampilkan ${start+1} sampai ${Math.min(start+pageSize,rows.length)} dari ${rows.length} data`:`Tidak ada data transaksi`;
-  $("#transactionTableBody").innerHTML=pagedRows.length?pagedRows.map(t=>`<tr><td class="transaction-number">${esc(t.invoice)}</td><td>${formatDateTime(t.createdAt)}</td><td>${esc(t.cashier)}</td><td>${esc(t.courier||"-")}</td><td>${esc(t.customer)}</td><td>${esc(t.paymentMethod)}</td><td>${money(t.items.reduce((s,i)=>s+i.qty,0))}</td><td>${money(t.subtotal)}</td><td>${money(t.discountPercent)}%</td><td>${money(t.discountAmount)}</td><td>${money(t.taxPercent)}%</td><td>${money(t.taxAmount)}</td><td>${money(t.total)}</td><td>${money(t.payment)}</td><td>${money(t.change)}</td><td>${money(t.downPayment)}</td><td>${money(t.remaining)}</td><td><span class="reference-status ${t.paymentStatus==="LUNAS"?"active":"inactive"}">${esc(t.paymentStatus)}</span></td><td><div class="row-actions"><button class="mini-btn view" data-tx-view="${t.invoice}">Detail</button><button class="mini-btn print" data-tx-print="${t.invoice}">Cetak</button>${hasPermission("transactions-delete")?`<button class="mini-btn delete" data-tx-delete="${t.invoice}">Hapus</button>`:""}</div></td></tr>`).join(""):`<tr><td colspan="19" class="empty-table">Transaksi tidak ditemukan.</td></tr>`;
+  $("#transactionTableBody").innerHTML=pagedRows.length?pagedRows.map(t=>`<tr class="${Number(t.remaining||0)>0?"unpaid-row":""}"><td class="transaction-number">${esc(t.invoice)}</td><td>${formatDateTime(t.createdAt)}</td><td>${esc(t.cashier)}</td><td>${esc(t.courier||"-")}</td><td>${esc(t.customer)}</td><td>${esc(t.paymentMethod)}</td><td>${money(t.items.reduce((s,i)=>s+i.qty,0))}</td><td>${money(t.subtotal)}</td><td>${money(t.discountPercent)}%</td><td>${money(t.discountAmount)}</td><td>${money(t.taxPercent)}%</td><td>${money(t.taxAmount)}</td><td>${money(t.total)}</td><td>${money(getTransactionPaidTotal(t))}</td><td>${money(t.change)}</td><td>${money(t.downPayment)}</td><td>${money(t.remaining)}</td><td><span class="reference-status ${t.paymentStatus==="LUNAS"?"active":"inactive"}">${esc(t.paymentStatus)}</span></td><td><div class="row-actions">${Number(t.remaining||0)>0?`<button class="mini-btn settle" data-tx-settle="${esc(t.invoice)}">Bayar Sisa</button>`:""}<button class="mini-btn view" data-tx-view="${t.invoice}">Detail</button><button class="mini-btn print" data-tx-print="${t.invoice}">Cetak</button>${hasPermission("transactions-delete")?`<button class="mini-btn delete" data-tx-delete="${t.invoice}">Hapus</button>`:""}</div></td></tr>`).join(""):`<tr><td colspan="19" class="empty-table">Transaksi tidak ditemukan.</td></tr>`;
   const visible=[];for(let p=1;p<=pageCount;p++){if(p===1||p===pageCount||Math.abs(p-transactionPage)<=1)visible.push(p)}
   let last=0;const buttons=[];for(const p of visible){if(p-last>1)buttons.push(`<span>…</span>`);buttons.push(`<button class="${p===transactionPage?"active":""}" data-tx-page="${p}">${p}</button>`);last=p}
   $("#transactionPagination").innerHTML=`<button data-tx-page="${transactionPage-1}" ${transactionPage===1?"disabled":""}>‹</button>${buttons.join("")}<button data-tx-page="${transactionPage+1}" ${transactionPage===pageCount?"disabled":""}>›</button>`;
@@ -675,13 +693,47 @@ function renderTransactions(){
 function transactionDetail(t){
   if(!t)return toast("Transaksi tidak ditemukan.");
   const isAdmin=hasPermission("transactions-delete");
+  const paidTotal=getTransactionPaidTotal(t),payments=(t.paymentHistory||[]);
   openModal("DETAIL TRANSAKSI KELUAR",`
     <div class="modal-detail-grid">
       <div><p>No. Transaksi: <b>${esc(t.invoice)}</b></p><p>Tgl. Transaksi: ${formatDateTime(t.createdAt)}</p><p>Kasir: ${esc(t.cashier)}</p><p>Pengantar: ${esc(t.courier||"-")}</p><p>Pelanggan: ${esc(t.customer)}</p><p>Metode Bayar: ${esc(t.paymentMethod)}</p><p>Status: <b>${esc(t.paymentStatus)}</b></p></div>
-      <div><p>Subtotal: <b>${rupiah(t.subtotal)}</b></p><p>Diskon: ${money(t.discountPercent)}% / ${rupiah(t.discountAmount)}</p><p>Pajak: ${money(t.taxPercent)}% / ${rupiah(t.taxAmount)}</p><p>Total: <b>${rupiah(t.total)}</b></p><p>Bayar: ${rupiah(t.payment)}</p><p>Kembali: ${rupiah(t.change)}</p><p>DP: ${rupiah(t.downPayment)}</p><p>Sisa: ${rupiah(t.remaining)}</p></div>
+      <div><p>Subtotal: <b>${rupiah(t.subtotal)}</b></p><p>Diskon: ${money(t.discountPercent)}% / ${rupiah(t.discountAmount)}</p><p>Pajak: ${money(t.taxPercent)}% / ${rupiah(t.taxAmount)}</p><p>Total: <b>${rupiah(t.total)}</b></p><p>Total Dibayar: ${rupiah(paidTotal)}</p><p>Kembali: ${rupiah(t.change)}</p><p>DP: ${rupiah(t.downPayment)}</p><p>Sisa: ${rupiah(t.remaining)}</p>${Number(t.remaining||0)>0?`<button class="button blue" data-tx-settle="${esc(t.invoice)}" type="button">Bayar Sisa</button>`:""}</div>
     </div>
+    ${payments.length?`<h4>Riwayat Pelunasan</h4><table class="excel-table"><thead><tr><th>Tanggal</th><th>Metode</th><th>Nominal</th><th>Kasir</th></tr></thead><tbody>${payments.map(payment=>`<tr><td>${esc(payment.date)}</td><td>${esc(payment.method)}</td><td>${money(payment.amount)}</td><td>${esc(payment.cashier||"-")}</td></tr>`).join("")}</tbody></table>`:""}
     <table class="excel-table"><thead><tr><th>Nama Barang</th>${isAdmin?"<th>Harga Modal</th><th>Profit</th>":""}<th>Tipe Harga</th><th>Harga</th><th>Diskon</th><th>Qty</th><th>Satuan</th><th>Jumlah</th></tr></thead><tbody>
     ${t.items.map(i=>`<tr><td>${esc(i.name)}</td>${isAdmin?`<td>${money(i.costPrice)}</td><td>${money(i.profit)}</td>`:""}<td>${esc(i.priceType)}</td><td>${money(calculateItemNetPrice(i.price,i.discount))}</td><td>${money(i.discount)}</td><td>${money(i.qty)}</td><td>${esc(i.unit)}</td><td>${money(i.amount)}</td></tr>`).join("")}</tbody></table>`);
+}
+function settlementModal(invoice){
+  const t=state.transactions.find(transaction=>transaction.invoice===invoice);
+  if(!t)return toast("Transaksi tidak ditemukan.");
+  if(Number(t.remaining||0)<=0)return toast("Transaksi ini sudah lunas.");
+  const methods=state.paymentMethods.filter(method=>method!=="DP");
+  openModal("Bayar Sisa DP",`
+    <form id="settlementForm" class="modal-form">
+      <input id="settlementInvoice" type="hidden" value="${esc(t.invoice)}">
+      <label>No. Transaksi<input value="${esc(t.invoice)}" readonly></label>
+      <label>Pelanggan<input value="${esc(t.customer||"UMUM")}" readonly></label>
+      <label>Total<input value="${rupiah(t.total)}" readonly></label>
+      <label>Sisa Piutang<input value="${rupiah(t.remaining)}" readonly></label>
+      <label>Nominal Bayar<input id="settlementAmount" type="number" min="1" max="${Number(t.remaining||0)}" value="${Number(t.remaining||0)}" required></label>
+      <label>Metode Bayar<select id="settlementMethod" required>${methods.map(method=>`<option ${method==="Tunai"?"selected":""}>${esc(method)}</option>`).join("")}</select></label>
+      <label>Tanggal Pembayaran<input id="settlementDate" type="date" value="${today()}" required></label>
+      <label>Catatan<input id="settlementNote" placeholder="Opsional"></label>
+      <div class="form-buttons wide"><button class="button green">Simpan Pembayaran</button></div>
+    </form>`);
+}
+function saveSettlement(e){
+  e.preventDefault();
+  const invoice=$("#settlementInvoice").value,t=state.transactions.find(transaction=>transaction.invoice===invoice);
+  if(!t)return toast("Transaksi tidak ditemukan.");
+  const remaining=Number(t.remaining||0),amount=Math.max(0,Number($("#settlementAmount").value||0)),method=$("#settlementMethod").value,date=$("#settlementDate").value;
+  if(!amount||amount>remaining)return toast("Nominal pelunasan tidak valid.");
+  if(!method||!date)return toast("Metode dan tanggal pembayaran wajib diisi.");
+  if(!confirm(`Simpan pembayaran ${rupiah(amount)} untuk transaksi ${invoice}?`))return;
+  t.paymentHistory=Array.isArray(t.paymentHistory)?t.paymentHistory:[];
+  t.paymentHistory.push({id:`${invoice}-PAY-${Date.now()}`,date,method,amount,createdAt:new Date().toISOString(),cashier:state.currentUser||state.settings.defaultCashier,note:$("#settlementNote").value.trim()});
+  Object.assign(t,normalizeTransaction(t));
+  saveState();closeModal();renderAll();toast(t.paymentStatus==="LUNAS"?"Pembayaran disimpan. Transaksi sudah lunas.":"Pembayaran disimpan.");
 }
 function deleteTransaction(invoice){
   if(!requirePermission("transactions-delete"))return;
@@ -724,12 +776,12 @@ function receiptDateParts(value){
 }
 function receiptPaymentHtml(transaction){
   if(transaction.paymentMethod==="Tunai")return `<div class="receipt-row"><span class="label">Tunai</span><span class="value">${rupiah(transaction.payment)}</span></div><div class="receipt-row"><span class="label">Kembalian</span><span class="value">${rupiah(transaction.change)}</span></div>`;
-  if(transaction.paymentMethod==="DP")return `<div class="receipt-row"><span class="label">DP</span><span class="value">${rupiah(transaction.downPayment)}</span></div><div class="receipt-row"><span class="label">Sisa Pembayaran</span><span class="value">${rupiah(transaction.remaining)}</span></div><div class="receipt-row"><span class="label">Status</span><span class="value">${esc(transaction.paymentStatus)}</span></div>`;
+  if(transaction.paymentMethod==="DP")return `<div class="receipt-row"><span class="label">DP</span><span class="value">${rupiah(transaction.downPayment)}</span></div><div class="receipt-row"><span class="label">Total Dibayar</span><span class="value">${rupiah(getTransactionPaidTotal(transaction))}</span></div><div class="receipt-row"><span class="label">Sisa Pembayaran</span><span class="value">${rupiah(transaction.remaining)}</span></div><div class="receipt-row"><span class="label">Status</span><span class="value">${esc(transaction.paymentStatus)}</span></div>`;
   return `<div class="receipt-row"><span class="label">${esc(transaction.paymentMethod)}</span><span class="value">${rupiah(transaction.cashIn)}</span></div>`;
 }
 function a4PaymentHtml(transaction){
   if(transaction.paymentMethod==="Tunai")return `<p>Tunai: <b>${rupiah(transaction.payment)}</b></p><p>Kembalian: <b>${rupiah(transaction.change)}</b></p>`;
-  if(transaction.paymentMethod==="DP")return `<p>DP: <b>${rupiah(transaction.downPayment)}</b></p><p>Sisa Pembayaran: <b>${rupiah(transaction.remaining)}</b></p><p>Status: <b>${esc(transaction.paymentStatus)}</b></p>`;
+  if(transaction.paymentMethod==="DP")return `<p>DP: <b>${rupiah(transaction.downPayment)}</b></p><p>Total Dibayar: <b>${rupiah(getTransactionPaidTotal(transaction))}</b></p><p>Sisa Pembayaran: <b>${rupiah(transaction.remaining)}</b></p><p>Status: <b>${esc(transaction.paymentStatus)}</b></p>`;
   return `<p>${esc(transaction.paymentMethod)}: <b>${rupiah(transaction.cashIn)}</b></p>`;
 }
 function renderReceiptHtml(transaction){
@@ -842,6 +894,7 @@ document.addEventListener("submit",async e=>{
   if(e.target.id==="stocktakeForm"){e.preventDefault();if(!requirePermission("stocktake"))return;const p=productById($("#stockProduct").value),physical=Number($("#stockPhysical").value||0);if(!p||physical<0)return toast("Data stok opname tidak valid.");
     const old=p.stock,diff=physical-old;state.stocktakes.unshift({id:nextId("OP",state.stocktakes),date:$("#stockDate").value,product:p.name,productId:p.id,category:p.category,unit:p.unit,systemStock:old,physicalStock:physical,difference:diff,note:$("#stockNote").value.trim()});p.stock=physical;saveState();e.target.reset();$("#stockDate").value=today();renderAll();toast("Stok opname disimpan.");
   }
+  if(e.target.id==="settlementForm")saveSettlement(e);
   if(e.target.id==="passwordForm"){e.preventDefault();if($("#newPassword").value!==$("#confirmPassword").value)return toast("Konfirmasi password tidak sama.");try{await apiRequest("/users/me/password",{method:"PUT",body:JSON.stringify({oldPassword:$("#oldPassword").value,newPassword:$("#newPassword").value})});e.target.reset();logout();toast("Password berhasil diubah. Silakan login kembali.")}catch(error){toast(error.message)}}
 });
 
@@ -906,6 +959,7 @@ document.addEventListener("click",async e=>{
   const cd=e.target.closest("[data-customer-delete]");if(cd&&requirePermission("customers")&&confirm("Hapus pelanggan?")){state.customers=state.customers.filter(x=>x.id!==cd.dataset.customerDelete);saveState();renderAll();}
   const ci=e.target.closest("[data-cart-delete]");if(ci){cart=cart.filter(x=>x.lineId!==ci.dataset.cartDelete);renderCart();}
   const iv=e.target.closest("[data-incoming-delete]");if(iv&&requirePermission("incoming"))deleteIncomingRecord(iv.dataset.incomingDelete);
+  const ts=e.target.closest("[data-tx-settle]");if(ts)settlementModal(ts.dataset.txSettle);
   const tv=e.target.closest("[data-tx-view]");if(tv)transactionDetail(state.transactions.find(x=>x.invoice===tv.dataset.txView));
   const tp=e.target.closest("[data-tx-print]");if(tp){selectedPrintInvoice=tp.dataset.txPrint;goPage("print")}
   const td=e.target.closest("[data-tx-delete]");if(td)deleteTransaction(td.dataset.txDelete);
@@ -916,7 +970,7 @@ document.addEventListener("click",async e=>{
   if(e.target.id==="exportSuppliersBtn")csvDownload("daftar-supplier.csv",["Nama","Alamat","Telepon","Email","Keterangan"],state.suppliers.map(x=>[x.name,x.address,x.phone,x.email,x.note]));
   if(e.target.id==="exportCustomersBtn")csvDownload("daftar-pelanggan.csv",["Nama","Alamat","Telepon","Email","Keterangan"],state.customers.map(x=>[x.name,x.address,x.phone,x.email,x.note]));
   if(e.target.id==="exportIncomingBtn")csvDownload("barang-masuk.csv",["Tanggal","Supplier","Produk","Kategori","Satuan","Harga Beli","Jumlah","Total"],state.incoming.map(x=>[x.date,x.supplier,x.product,x.category,x.unit,x.purchasePrice,x.qty,x.total]));
-  if(e.target.id==="exportTransactionsBtn")csvDownload("transaksi-keluar.csv",["No Transaksi","Tanggal","Kasir","Pelanggan","Metode","Subtotal","Diskon","Pajak","Total","Bayar","Kembali"],state.transactions.map(x=>[x.invoice,x.createdAt,x.cashier,x.customer,x.paymentMethod,x.subtotal,x.discountAmount,x.taxAmount,x.total,x.payment,x.change]));
+  if(e.target.id==="exportTransactionsBtn")csvDownload("transaksi-keluar.csv",["No Transaksi","Tanggal","Kasir","Pelanggan","Metode","Subtotal","Diskon","Pajak","Total","Total Dibayar","Kembali","DP","Sisa","Status"],state.transactions.map(x=>[x.invoice,x.createdAt,x.cashier,x.customer,x.paymentMethod,x.subtotal,x.discountAmount,x.taxAmount,x.total,getTransactionPaidTotal(x),x.change,x.downPayment,x.remaining,x.paymentStatus]));
 });
 document.addEventListener("keydown",e=>{
   if(e.key==="Enter"&&e.target.id==="printInvoiceSearch"){
