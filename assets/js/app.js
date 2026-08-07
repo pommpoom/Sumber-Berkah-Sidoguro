@@ -393,6 +393,13 @@ function renderDashboard(){
   $("#dashboardRecentTransactions").innerHTML=daily.slice(0,6).map(t=>`<div class="dashboard-data-row"><span><b>${esc(t.invoice)}</b><small>${esc(t.customer||"UMUM")} · ${esc(t.paymentMethod)}</small></span><strong>${rupiah(t.total)}</strong></div>`).join("")||`<p class="dashboard-empty">Belum ada transaksi pada tanggal ini.</p>`;
   const productSales={};daily.forEach(t=>t.items.forEach(i=>{const x=productSales[i.productId]||(productSales[i.productId]={name:i.name,qty:0,revenue:0,profit:0});x.qty+=Number(i.qty||0);x.revenue+=Number(i.amount||0);x.profit+=Number(i.profit||0)}));const topProducts=Object.values(productSales).sort((a,b)=>b.qty-a.qty).slice(0,6);
   $("#dashboardTopProducts").innerHTML=topProducts.map((x,i)=>`<div class="dashboard-data-row ranked"><i>${i+1}</i><span><b>${esc(x.name)}</b><small>${money(x.qty)} terjual</small></span><strong>${rupiah(x.revenue)}</strong></div>`).join("")||`<p class="dashboard-empty">Belum ada produk terjual.</p>`;
+  const showPurchases=hasPermission("incoming");
+  $("#dashboardPurchasesCard").parentElement.classList.toggle("admin-purchases",showPurchases);
+  $("#dashboardPurchasesCard").classList.toggle("hidden",!showPurchases);
+  if(showPurchases){
+    const month=selectedDate.slice(0,7),monthlyIncoming=state.incoming.filter(x=>x.date.startsWith(month)),purchaseTotal=monthlyIncoming.reduce((s,x)=>s+Number(x.total||0),0),supplierTotals=monthlyIncoming.reduce((m,x)=>{m[x.supplier]=(m[x.supplier]||0)+Number(x.total||0);return m},{}),topSuppliers=Object.entries(supplierTotals).sort((a,b)=>b[1]-a[1]).slice(0,3);
+    $("#dashboardPurchases").innerHTML=`<div class="purchase-summary"><span><small>Total Pembelian</small><b>${rupiah(purchaseTotal)}</b></span><span><small>Total Transaksi</small><b>${monthlyIncoming.length}</b></span></div>${topSuppliers.map(([name,value],i)=>`<div class="dashboard-data-row"><span>${i+1}. ${esc(name||"Tanpa supplier")}</span><b>${rupiah(value)}</b></div>`).join("")||`<p class="dashboard-empty">Belum ada pembelian bulan ini.</p>`}`;
+  }
   const allReceivable=unpaid.reduce((sum,t)=>sum+Number(t.remaining||0),0);
   $("#dashboardNotifications").innerHTML=`<p class="critical">${emptyStocks.length} produk stok habis</p><p class="warning">${lowStocks.length-emptyStocks.length} produk stok menipis</p>${unpaid.length?`<p class="warning">${unpaid.length} transaksi belum lunas · ${rupiah(allReceivable)}</p>`:`<p class="success">Semua transaksi sudah lunas</p>`}${state.lastBackupAt?`<p class="success">Backup terakhir: ${formatDateTime(state.lastBackupAt)}</p>`:""}`;
 }
@@ -678,8 +685,6 @@ function renderTransactions(){
   fillSelect($("#transactionPaymentFilter"),state.paymentMethods,x=>x,x=>x,true,"Semua Metode Bayar");
   const q=$("#transactionSearch").value.toLowerCase(), date=$("#transactionDateFilter").value, payment=$("#transactionPaymentFilter").value;
   const rows=state.transactions.filter(t=>(t.invoice+" "+t.customer).toLowerCase().includes(q)&&(!date||t.createdAt.slice(0,10)===date)&&(!payment||t.paymentMethod===payment));
-  const unpaid=state.transactions.filter(t=>Number(t.remaining||0)>0);
-  $("#transactionUnpaidPanel").innerHTML=unpaid.length?`<div><b>${unpaid.length} transaksi belum lunas</b><span>Total sisa piutang ${rupiah(unpaid.reduce((sum,t)=>sum+Number(t.remaining||0),0))}</span></div><div>${unpaid.slice(0,5).map(t=>`<button class="mini-btn settle" data-tx-settle="${esc(t.invoice)}">${esc(t.invoice)} · ${rupiah(t.remaining)}</button>`).join("")}</div>`:`<div><b>Semua transaksi sudah lunas</b><span>Tidak ada piutang DP yang perlu ditagih.</span></div>`;
   const pageSize=10,pageCount=Math.max(1,Math.ceil(rows.length/pageSize));
   transactionPage=Math.min(Math.max(transactionPage,1),pageCount);
   const start=(transactionPage-1)*pageSize,pagedRows=rows.slice(start,start+pageSize);
