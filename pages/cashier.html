@@ -55,8 +55,8 @@
       <label>Nama Produk<span class="quick-entry-control"><input id="cashProduct" list="cashProductOptions" placeholder="Ketik untuk mencari produk" autocomplete="off"><button class="quick-add-button" id="quickAddProductBtn" type="button">+ Tambah</button></span><datalist id="cashProductOptions"></datalist></label>
       <label>Type Harga<select id="cashPriceType"><option value="wholesale">Harga Jual Grosir</option><option value="retail">Harga Jual Satuan</option></select></label>
       <label>Harga<input id="cashPrice" type="number" min="0"></label>
-      <label>Diskon<input id="cashItemDiscount" type="number" value="0" min="0"></label>
-      <label>Banyaknya<input id="cashQty" type="number" value="1" min="0.01" step="0.01"></label>
+      <label>Diskon<input id="cashItemDiscount" type="number" min="0" placeholder="Opsional"></label>
+      <label>Banyaknya<input id="cashQty" type="number" min="0.01" step="0.01" placeholder="Isi qty"></label>
       <label>Jumlah<input id="cashLineTotal" readonly></label>
       <button class="button blue wide add-cart-button" id="addCartItemBtn">Tambah</button>
     </aside>

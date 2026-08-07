@@ -527,7 +527,8 @@ function contactModal(type,id=null,initialName=""){
 
 function renderIncoming(){
   fillSelect($("#incomingSupplier"),state.suppliers,x=>x.name,x=>x.name,true,"-- Supplier --");
-  fillSelect($("#incomingProduct"),state.products.filter(p=>p.active),x=>x.id,x=>x.name,true,"-- Produk --");
+  const activeProducts=state.products.filter(product=>product.active);
+  $("#incomingProductOptions").innerHTML=activeProducts.map(product=>`<option value="${esc(product.name)}" label="Stok ${money(product.stock)}"></option>`).join("");
   const q=$("#incomingSearch").value.toLowerCase(), date=$("#incomingDateFilter").value;
   const rows=state.incoming.filter(x=>(x.product+" "+x.supplier).toLowerCase().includes(q)&&(!date||x.date===date));
   const qty=rows.reduce((s,x)=>s+Number(x.qty||0),0), total=rows.reduce((s,x)=>s+Number(x.total||0),0);
@@ -535,8 +536,16 @@ function renderIncoming(){
   $("#incomingTableBody").innerHTML=rows.length?rows.map(x=>`<tr><td>${esc(x.date)}</td><td>${esc(x.supplier)}</td><td>${esc(x.product)}</td><td>${esc(x.category)}</td><td>${esc(x.unit)}</td><td>${money(x.purchasePrice)}</td><td>${money(x.qty)}</td><td>${money(x.total)}</td><td><button class="mini-btn delete" data-incoming-delete="${x.id}">Hapus</button></td></tr>`).join(""):`<tr><td colspan="9" class="empty-table">Belum ada catatan barang masuk.</td></tr>`;
   updateIncomingSummary();
 }
+function selectedIncomingProduct(){
+  const input=$("#incomingProduct"),value=normalizeProductName(input.value);
+  const selectedById=productById(input.dataset.productId);
+  if(selectedById?.active&&normalizeProductName(selectedById.name)===value)return selectedById;
+  const product=state.products.find(item=>item.active&&normalizeProductName(item.name)===value);
+  if(product)input.dataset.productId=product.id;else delete input.dataset.productId;
+  return product;
+}
 function updateIncomingProduct(){
-  const p=productById($("#incomingProduct").value);
+  const p=selectedIncomingProduct();
   $("#incomingCategory").value=p?.category||""; $("#incomingUnit").value=p?.unit||"";
   $("#incomingPrice").value=p?.costPrice||0; updateIncomingTotal();
 }
@@ -544,7 +553,7 @@ function updateIncomingTotal(){
   $("#incomingTotal").value=money(Number($("#incomingPrice").value||0)*Number($("#incomingQty").value||0)); updateIncomingSummary();
 }
 function updateIncomingSummary(){
-  const product=productById($("#incomingProduct").value),qty=Number($("#incomingQty").value||0),total=Number($("#incomingPrice").value||0)*qty;
+  const product=selectedIncomingProduct(),qty=Number($("#incomingQty").value||0),total=Number($("#incomingPrice").value||0)*qty;
   $("#incomingSummarySupplier").textContent=$("#incomingSupplier").value||"-";$("#incomingSummaryProduct").textContent=product?.name||"-";$("#incomingSummaryQty").textContent=money(qty);$("#incomingSummaryTotal").textContent=rupiah(total);
 }
 
@@ -576,11 +585,16 @@ function selectedCashProduct(){
 function updateCashProduct(){
   const p=selectedCashProduct();
   const price=$("#cashPriceType").value==="retail"?p?.retailPrice:p?.wholesalePrice;
-  $("#cashPrice").value=price||0; $("#cashItemDiscount").value=p?.discount||0; updateCashLine();
+  $("#cashPrice").value=p?price||0:""; $("#cashItemDiscount").value=p&&Number(p.discount||0)>0?p.discount:""; updateCashLine();
 }
 function updateCashLine(){
   const total=calculateItemAmount($("#cashPrice").value,$("#cashItemDiscount").value,$("#cashQty").value);
-  $("#cashLineTotal").value=money(total);
+  $("#cashLineTotal").value=$("#cashPrice").value||$("#cashItemDiscount").value||$("#cashQty").value?money(total):"";
+}
+function clearCashItemEntry(){
+  $("#cashProduct").value=""; delete $("#cashProduct").dataset.productId;
+  $("#cashPriceType").value="wholesale";
+  $("#cashPrice").value=""; $("#cashItemDiscount").value=""; $("#cashQty").value=""; updateCashLine();
 }
 function addCartItem(){
   const p=selectedCashProduct(); if(!p)return toast("Produk belum terdaftar. Cari produk lain atau klik + Tambah.");
@@ -592,7 +606,7 @@ function addCartItem(){
   cart.push({lineId:crypto.randomUUID?.()||String(Date.now()),productId:p.id,name:p.name,costPrice:Number(p.costPrice||0),
     priceType:$("#cashPriceType").value==="retail"?"Harga Jual Satuan":"Harga Jual Grosir",
     price,discount,qty,unit:p.unit,amount:calculateItemAmount(price,discount,qty),profit:(price-discount-Number(p.costPrice||0))*qty});
-  renderCart(); toast("Produk ditambahkan.");
+  renderCart(); clearCashItemEntry(); $("#cashProduct").focus(); toast("Produk ditambahkan.");
 }
 function cartTotals(){
   const totals=calculateTransactionTotals(cart,$("#cashDiscount").value);
@@ -617,8 +631,7 @@ function renderCart(){
 function clearCashier(){
   cart=[]; $("#cashDiscount").value=0; $("#cashPayment").value=0; $("#cashCourier").value="";
   $("#cashCustomer").value="UMUM";
-  $("#cashPaymentMethod").value=""; $("#cashProduct").value=""; delete $("#cashProduct").dataset.productId; $("#cashPriceType").value="wholesale";
-  $("#cashPrice").value=0; $("#cashItemDiscount").value=0; $("#cashQty").value=1; updateCashLine();
+  $("#cashPaymentMethod").value=""; clearCashItemEntry();
   $("#cashInvoice").value=nextInvoice(); renderCart();
 }
 function saveTransaction(action="save"){
@@ -821,7 +834,7 @@ document.addEventListener("submit",async e=>{
     const x={id:id||nextId(type==="supplier"?"S":"C",list),name:$("#contactName").value.trim(),address:$("#contactAddress").value.trim(),phone:$("#contactPhone").value.trim(),email:$("#contactEmail").value.trim(),note:$("#contactNote").value.trim()};
     if(id)list[list.findIndex(a=>a.id===id)]=x;else list.push(x);saveState();closeModal();renderAll();if(quickAdd)$("#cashCustomer").value=x.name;toast("Data disimpan.");
   }
-  if(e.target.id==="incomingForm"){e.preventDefault();if(!requirePermission("incoming"))return;const p=productById($("#incomingProduct").value),qty=Number($("#incomingQty").value||0),price=Number($("#incomingPrice").value||0);
+  if(e.target.id==="incomingForm"){e.preventDefault();if(!requirePermission("incoming"))return;const p=selectedIncomingProduct(),qty=Number($("#incomingQty").value||0),price=Number($("#incomingPrice").value||0);
     if(!p||!$("#incomingSupplier").value||qty<=0||price<0)return toast("Data barang masuk belum lengkap atau tidak valid.");
     const previousStock=Math.max(0,toSafeNumber(p.stock)),previousCostPrice=Math.max(0,toSafeNumber(p.costPrice));
     const resultingCostPrice=calculateWeightedAverageCost(previousStock,previousCostPrice,qty,price);
@@ -914,6 +927,7 @@ document.addEventListener("keydown",e=>{
 });
 document.addEventListener("input",e=>{
   if(["productSearch","supplierSearch","customerSearch","incomingSearch","incomingDateFilter","stockSearch","stockDateFilter","transactionSearch","transactionDateFilter"].includes(e.target.id)){if(e.target.id.startsWith("transaction"))transactionPage=1;if(e.target.id==="productSearch")productPage=1;if(e.target.id==="customerSearch")customerPage=1;renderAll();}
+  if(e.target.id==="incomingProduct")updateIncomingProduct();
   if(["incomingPrice","incomingQty"].includes(e.target.id))updateIncomingTotal();
   if(["cashPrice","cashItemDiscount","cashQty"].includes(e.target.id))updateCashLine();
   if(e.target.id==="cashProduct")updateCashProduct();
@@ -929,7 +943,7 @@ document.addEventListener("keydown",e=>{
   }
 });
 document.addEventListener("reset",e=>{
-  if(e.target.id==="incomingForm")setTimeout(()=>{$("#incomingDate").value=today();updateIncomingSummary();},0);
+  if(e.target.id==="incomingForm")setTimeout(()=>{delete $("#incomingProduct").dataset.productId;$("#incomingDate").value=today();updateIncomingProduct();},0);
   if(e.target.id==="stocktakeForm")setTimeout(()=>{$("#stockDate").value=today();updateStockSummary();},0);
 });
 document.addEventListener("change",e=>{

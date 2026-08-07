@@ -10,7 +10,7 @@
         <div class="incoming-form-grid">
           <label>Tanggal <b>*</b><input id="incomingDate" type="date" required><small>Tanggal barang diterima</small></label>
           <label>Nama Supplier<select id="incomingSupplier"></select><small>Pilih supplier dari daftar</small></label>
-          <label>Nama Produk <b>*</b><select id="incomingProduct" required></select><small>Pilih produk dari daftar</small></label>
+          <label>Nama Produk <b>*</b><input id="incomingProduct" list="incomingProductOptions" placeholder="Ketik untuk mencari produk" autocomplete="off" required><datalist id="incomingProductOptions"></datalist><small>Ketik atau pilih produk dari daftar</small></label>
           <label>Kategori<input id="incomingCategory" readonly placeholder="-"><small>Terisi otomatis berdasarkan produk</small></label>
           <label>Satuan<input id="incomingUnit" readonly placeholder="-"><small>Terisi otomatis berdasarkan produk</small></label>
           <label>Harga Beli<input id="incomingPrice" type="number" min="0" value="0" required><small>Harga beli per satuan</small></label>
