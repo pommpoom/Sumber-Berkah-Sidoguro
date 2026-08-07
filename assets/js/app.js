@@ -218,7 +218,7 @@ function currentUser(){return sessionUser}
 function hasPermission(permission){
   const level=currentUser()?.level||"KASIR";
   if(level==="ADMINISTRATOR")return true;
-  return ["cashier","products-view","transactions-view","print","password"].includes(permission);
+  return ["cashier","products-view","transactions-view","print"].includes(permission);
 }
 function requirePermission(permission){if(hasPermission(permission))return true;toast("Akses ini hanya untuk ADMINISTRATOR.");return false}
 function calculateTransactionTotals(items,discountInput=0){
@@ -297,8 +297,8 @@ function showApp(){
   $("#loginScreen").classList.add("hidden"); $("#app").classList.remove("hidden");
   $("#activeUser").textContent=state.currentUser || "-";
   const admin=sessionUser?.level==="ADMINISTRATOR";
-  const cashierPages=new Set(["dashboard","cashier","transactions","print","products","password","help"]);
-  $$("#topNav [data-page]").forEach(button=>button.classList.toggle("hidden",admin?button.dataset.page==="password":!cashierPages.has(button.dataset.page)));
+  const cashierPages=new Set(["dashboard","cashier","transactions","print","products","help"]);
+  $$("#topNav [data-page]").forEach(button=>button.classList.toggle("hidden",admin?false:!cashierPages.has(button.dataset.page)));
   goPage("dashboard");startServerRefresh();if(sessionUser?.level==="ADMINISTRATOR")loadUsers().catch(error=>toast(error.message));
 }
 function logout(){
@@ -306,7 +306,7 @@ function logout(){
 }
 
 function goPage(name){
-  const permissions={settings:"settings",references:"references",suppliers:"suppliers",customers:"customers",incoming:"incoming",stocktake:"stocktake"};
+  const permissions={settings:"settings",references:"references",suppliers:"suppliers",customers:"customers",incoming:"incoming",stocktake:"stocktake",password:"password"};
   if(permissions[name]&&!requirePermission(permissions[name]))return;
   $$(".page").forEach(x=>x.classList.remove("active"));
   $(`#${name}Page`).classList.add("active");
@@ -424,7 +424,7 @@ function renderUsers(){
         <tbody>${users.map(u=>`<tr><td><b>${esc(u.username)}</b></td><td>${esc(u.level)}</td><td><span class="reference-status ${u.active?"active":"inactive"}">${u.active?"Aktif":"Tidak Aktif"}</span></td>
         <td><button class="mini-btn edit" data-user-edit="${u.id}">Edit</button> <button class="mini-btn delete" data-user-delete="${u.id}">Hapus</button></td></tr>`).join("")}</tbody>
       </table></div>
-      <footer class="reference-card-footer"><span>${users.length} pengguna</span><span>Password tidak pernah ditampilkan</span></footer>
+      <footer class="reference-card-footer"><span>${users.length} pengguna</span><span>Admin dapat reset password pengguna</span></footer>
     </article>`;
 }
 function referenceModal(index=null){

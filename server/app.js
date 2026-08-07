@@ -281,7 +281,7 @@ async function updatePassword(id, password) {
   if (!data) throw Object.assign(new Error('Pengguna tidak ditemukan.'), { status: 404 });
 }
 app.put('/api/users/:id/password', requireAuth, requireAdmin, async (req, res, next) => { try { await updatePassword(req.params.id, req.body?.password); res.json({ ok: true }); } catch (error) { next(error); } });
-app.put('/api/users/me/password', requireAuth, async (req, res, next) => {
+app.put('/api/users/me/password', requireAuth, requireAdmin, async (req, res, next) => {
   try {
     const { data: user, error } = await getRuntime().supabase.from('app_users').select('password_hash').eq('id', req.user.id).single();
     if (error) throw error;
