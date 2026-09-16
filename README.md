@@ -31,6 +31,7 @@ Langkah deployment:
    | `SUPABASE_URL` | URL HTTPS project Supabase |
    | `SUPABASE_SECRET_KEY` | Secret/service-role key; hanya server |
    | `SUPABASE_ANON_KEY` | Publishable/anon key Supabase untuk notifikasi Realtime; aman berada di bundle frontend |
+   | `STATE_JSON_LIMIT_KB` | Opsional, default `512`; hanya naikkan setelah mengukur backup, maksimum `1024` |
    | `CORS_ORIGIN` | URL production Vercel/custom domain, misalnya `https://web-kasir-sumber-berkah.vercel.app` |
    | `INITIAL_ADMIN_USERNAME` | Misalnya `ADMIN` |
    | `INITIAL_ADMIN_PASSWORD` | Password awal kuat, minimal 8 karakter |
@@ -51,15 +52,32 @@ Jangan menambahkan `PORT` ke environment Vercel. Jangan memakai anon key sebagai
 - JWT disimpan pada cookie `HttpOnly`, `Secure`, `SameSite=Lax` di production; frontend tidak menyimpan token atau password di localStorage.
 - Endpoint user admin dilindungi role, sedangkan ganti password sendiri mewajibkan password lama.
 - Kasir menerima state tanpa harga modal/profit dan tidak dapat mengubah master data, menghapus transaksi, atau mengelola user melalui API.
-- Perubahan state memicu sinyal Supabase Realtime tanpa payload sensitif; browser lain langsung mengambil data terbaru melalui API. Jika publishable key belum tersedia, build tetap berjalan dan memakai polling 2 detik; saat Realtime aktif, polling 8 detik tetap menjadi fallback.
+- Perubahan state memicu sinyal Supabase Realtime tanpa payload sensitif; browser lain langsung mengambil data terbaru melalui API. Polling tidak berjalan saat Realtime terhubung. Jika Realtime tidak tersedia, satu fallback non-overlap berjalan setiap 30 detik dan berhenti saat tab tersembunyi.
 - Restore/backup frontend hanya tersedia bagi administrator, tidak menyertakan user, dan menolak field sensitif.
 - Instalasi baru memulai `products`, `suppliers`, `customers`, `transactions`, `incoming`, dan `stocktakes` sebagai array kosong.
+
+## Perlindungan trafik
+
+- Penyimpanan state di-debounce 1 detik. Respons 400/403/413 tidak dicoba ulang otomatis; gangguan jaringan, 429, dan 5xx memakai exponential backoff dengan maksimum lima retry otomatis.
+- Browser memeriksa ukuran state sebelum upload. Default maksimum request state adalah 512 KB. Login dan mutasi user dibatasi 8 KB.
+- `PUT /api/state` dibatasi 60 request per 5 menit per user, `GET /api/state` 180 per 5 menit per user, login 10 percobaan per 15 menit per IP, dan seluruh API 300 request per 5 menit per IP. Rate limit ini bersifat ringan/in-memory pada function instance; perlindungan utama terhadap storm tetap retry yang terbatas.
+- Endpoint JSON menolak Content-Type yang salah, JSON rusak, dan payload berlebih dengan status 415, 400, atau 413.
+- Log API tidak memuat body, password, cookie, token, atau authorization header. Semua write/error dicatat; successful GET di-sample 10%. Field log: method, endpoint, status, perkiraan ukuran request, status autentikasi, dan durasi.
+
+Karena data operasional disimpan sebagai satu dokumen JSON, ukur backup sebelum deploy. Ukuran file backup yang pretty-printed bukan ukuran request sebenarnya; untuk mengukur bentuk compact jalankan:
+
+```bash
+node -e "const fs=require('fs');const data=JSON.parse(fs.readFileSync('PATH-BACKUP.json','utf8'));console.log(Buffer.byteLength(JSON.stringify({state:data,expectedVersion:0})))"
+```
+
+Jika hasilnya mendekati atau melebihi 524288 byte, set `STATE_JSON_LIMIT_KB` sedikit di atas kebutuhan (maksimum 1024), lalu rencanakan pengarsipan transaksi lama. Jangan menaikkan limit tanpa ukuran nyata.
 
 ## Pemeriksaan sebelum deploy
 
 ```bash
 npm ci
 npm run check
+npm test
 npm run build
 ```
 

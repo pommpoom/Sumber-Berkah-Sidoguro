@@ -18,11 +18,21 @@ let activePrintFrame = null;
 let apiToken = "";
 let serverSyncTimer;
 let serverStateVersion = null;
+let serverStateRequestLimit = 512 * 1024;
 let lastSyncedState = null;
 let stateDirty = false;
 let syncInFlight = false;
+let syncController = null;
 let syncErrorShown = false;
 let serverRefreshTimer;
+let refreshInFlight = false;
+let refreshController = null;
+let syncFailureCount = 0;
+let sessionGeneration = 0;
+const SYNC_DEBOUNCE_MS = 1000;
+const SYNC_RETRY_BASE_MS = 2000;
+const MAX_AUTOMATIC_SYNC_RETRIES = 5;
+const FALLBACK_REFRESH_MS = 30000;
 
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
@@ -152,57 +162,107 @@ function mergeValue(base,local,remote){
   return clone(local);
 }
 function normalizeInMemoryState(){state=migrateState(state);}
-async function getServerState(){
-  const response=await fetch(`${API_BASE_URL}/state`,{credentials:"include",signal:timeoutSignal(),cache:"no-store"});
+async function getServerState(signal=timeoutSignal()){
+  const response=await fetch(`${API_BASE_URL}/state`,{credentials:"include",signal,cache:"no-store"});
   if(response.status===401)throw new Error("Sesi login berakhir.");
-  if(!response.ok)throw new Error("Data server tidak dapat dimuat.");
+  if(!response.ok){const body=await response.json().catch(()=>null);throw new Error(body?.message||"Data server tidak dapat dimuat.")}
   return response.json();
 }
 function showSyncError(message){if(!syncErrorShown){syncErrorShown=true;toast(message)}}
 async function syncServerState(){
   if(!apiToken||location.protocol==="file:"||syncInFlight||!stateDirty)return;
   syncInFlight=true;
+  const activeGeneration=sessionGeneration,controller=new AbortController();syncController=controller;
+  const timeout=timeoutSignal(),signal=typeof AbortSignal.any==="function"?AbortSignal.any([controller.signal,...(timeout?[timeout]:[])]):controller.signal;
+  let retryDelay=null,saveNewerState=false;
   try{
     for(let attempts=0;attempts<3&&stateDirty;attempts++){
+      saveNewerState=false;
       const payload=statePayload();
-      const response=await fetch(`${API_BASE_URL}/state`,{method:"PUT",credentials:"include",signal:timeoutSignal(),headers:{"Content-Type":"application/json"},body:JSON.stringify({state:payload,expectedVersion:Number(serverStateVersion||0)})});
-      if(response.status===401){apiToken="";showSyncError("Sesi berakhir. Silakan login kembali.");return}
+      const requestBody=JSON.stringify({state:payload,expectedVersion:Number(serverStateVersion||0)});
+      if(new Blob([requestBody]).size>serverStateRequestLimit){const error=new Error(`Data aplikasi melebihi batas ${Math.floor(serverStateRequestLimit/1024)} KB. Buat backup dan naikkan STATE_JSON_LIMIT_KB secara terukur.`);error.retryable=false;throw error}
+      const response=await fetch(`${API_BASE_URL}/state`,{method:"PUT",credentials:"include",signal,headers:{"Content-Type":"application/json"},body:requestBody});
+      if(activeGeneration!==sessionGeneration||!apiToken)return;
+      if(response.status===401){logout();toast("Sesi berakhir. Silakan login kembali.");return}
       if(response.status===409){
-        const remote=await getServerState();
+        const remote=await getServerState(signal);
+        if(activeGeneration!==sessionGeneration||!apiToken)return;
         const currentUser=state.currentUser;
         state=migrateState(mergeValue(lastSyncedState||remote.state||{},payload,remote.state||{}),{log:true});
-        state.currentUser=currentUser;normalizeInMemoryState();serverStateVersion=Number(remote.version||0);lastSyncedState=clone(remote.state||{});stateDirty=true;continue;
+        state.currentUser=currentUser;normalizeInMemoryState();serverStateVersion=Number(remote.version||0);serverStateRequestLimit=Number(remote.maxRequestBytes||serverStateRequestLimit);lastSyncedState=clone(remote.state||{});stateDirty=true;continue;
       }
-      if(!response.ok)throw new Error("Data tidak dapat disimpan ke server.");
-      const saved=await response.json();serverStateVersion=Number(saved.version);lastSyncedState=clone(payload);stateDirty=!sameValue(payload,statePayload());syncErrorShown=false;
+      if(!response.ok){
+        const body=await response.json().catch(()=>null),error=new Error(body?.message||"Data tidak dapat disimpan ke server.");
+        error.retryable=response.status===408||response.status===429||response.status>=500;
+        if(response.status===429){const seconds=Number(response.headers.get("Retry-After"));if(Number.isFinite(seconds)&&seconds>0)error.retryAfter=seconds*1000}
+        throw error;
+      }
+      const saved=await response.json();serverStateVersion=Number(saved.version);lastSyncedState=clone(payload);stateDirty=!sameValue(payload,statePayload());syncFailureCount=0;syncErrorShown=false;
+      saveNewerState=stateDirty;
     }
-    if(stateDirty)showSyncError("Sinkronisasi tertunda. Periksa koneksi lalu coba lagi.");
-  }catch(error){showSyncError(error.message||"Sinkronisasi gagal. Periksa koneksi ke server.");}
-  finally{syncInFlight=false;if(stateDirty&&apiToken)queueServerSync();}
+    if(stateDirty&&!saveNewerState){
+      syncFailureCount++;
+      if(syncFailureCount<=MAX_AUTOMATIC_SYNC_RETRIES)retryDelay=Math.min(30000,SYNC_RETRY_BASE_MS*2**(syncFailureCount-1));
+      showSyncError("Data berubah bersamaan di perangkat lain. Sinkronisasi akan dicoba kembali secara terbatas.");
+    }
+  }catch(error){
+    if(activeGeneration!==sessionGeneration||!apiToken||controller.signal.aborted)return;
+    const retryable=error.retryable!==false;
+    if(retryable){
+      syncFailureCount++;
+      if(syncFailureCount<=MAX_AUTOMATIC_SYNC_RETRIES)retryDelay=error.retryAfter||Math.min(30000,SYNC_RETRY_BASE_MS*2**(syncFailureCount-1));
+    }
+    showSyncError(retryable?`${error.message||"Sinkronisasi gagal."} Percobaan ulang dibatasi.`:error.message||"Data ditolak server dan tidak akan dikirim ulang otomatis.");
+  }finally{
+    const ownsSync=syncController===controller;
+    if(ownsSync){syncController=null;syncInFlight=false}
+    if(ownsSync&&activeGeneration===sessionGeneration&&stateDirty&&apiToken){
+      if(saveNewerState)queueServerSync();
+      else if(retryDelay!==null)queueServerSync(retryDelay);
+    }
+  }
 }
-function queueServerSync(){
+function queueServerSync(delay=SYNC_DEBOUNCE_MS){
   if(!apiToken||location.protocol==="file:")return;
-  clearTimeout(serverSyncTimer);serverSyncTimer=setTimeout(syncServerState,250);
+  clearTimeout(serverSyncTimer);serverSyncTimer=setTimeout(syncServerState,delay);
 }
-function saveState(){normalizeInMemoryState();stateDirty=true;queueServerSync();}
+function saveState(){
+  normalizeInMemoryState();stateDirty=!sameValue(statePayload(),lastSyncedState);
+  clearTimeout(serverSyncTimer);
+  if(stateDirty){syncFailureCount=0;queueServerSync()}
+}
 async function refreshServerState({notify=false}={}){
-  if(!apiToken||stateDirty||syncInFlight||$("#modal")?.classList.contains("open"))return;
+  if(!apiToken||stateDirty||syncInFlight||refreshInFlight||document.visibilityState==="hidden"||$("#modal")?.classList.contains("open"))return;
+  refreshInFlight=true;
+  const controller=new AbortController();refreshController=controller;
+  const timeout=timeoutSignal(),signal=typeof AbortSignal.any==="function"?AbortSignal.any([controller.signal,...(timeout?[timeout]:[])]):controller.signal;
   try{
-    const remote=await getServerState(),remoteVersion=Number(remote.version||0);
+    const activeUserId=sessionUser?.id,remote=await getServerState(signal),remoteVersion=Number(remote.version||0);
+    if(!apiToken||sessionUser?.id!==activeUserId)return;
+    serverStateRequestLimit=Number(remote.maxRequestBytes||serverStateRequestLimit);
     if(serverStateVersion===null||remoteVersion!==serverStateVersion){
       const currentUser=state.currentUser;state=migrateState(remote.state||{}, {log:true});state.currentUser=currentUser;normalizeInMemoryState();serverStateVersion=remoteVersion;lastSyncedState=statePayload();renderAll();if(notify)toast("Data terbaru dari server telah dimuat.");
     }
     syncErrorShown=false;
   }catch(error){
+    if(!apiToken||error.name==="AbortError")return;
     if(error.message==="Sesi login berakhir."){logout();toast("Sesi berakhir. Silakan login kembali.");return}
     showSyncError(error.message||"Data server tidak dapat dimuat.");
-  }
+  }finally{if(refreshController===controller){refreshController=null;refreshInFlight=false}}
+}
+function realtimeConnected(){return Boolean(window.KASIR_REALTIME?.isConnected?.())}
+function scheduleFallbackRefresh(delay=FALLBACK_REFRESH_MS){
+  clearTimeout(serverRefreshTimer);
+  if(!apiToken||realtimeConnected()||document.visibilityState==="hidden")return;
+  serverRefreshTimer=setTimeout(async()=>{if(!realtimeConnected())await refreshServerState({notify:true});scheduleFallbackRefresh()},delay);
 }
 function startServerRefresh(){
-  clearInterval(serverRefreshTimer);if(!apiToken)return;
-  window.KASIR_REALTIME?.subscribe(()=>refreshServerState({notify:true}));
-  const refreshInterval=window.KASIR_REALTIME?.enabled?8000:2000;
-  serverRefreshTimer=setInterval(()=>refreshServerState({notify:true}),refreshInterval);
+  clearTimeout(serverRefreshTimer);if(!apiToken)return;
+  window.KASIR_REALTIME?.subscribe(
+    ()=>refreshServerState({notify:true}),
+    connected=>{if(connected)clearTimeout(serverRefreshTimer);else scheduleFallbackRefresh()}
+  );
+  scheduleFallbackRefresh();
 }
 state=loadState();
 selectedPrintInvoice=state.transactions[0]?.invoice||"";
@@ -284,16 +344,16 @@ async function login(username,password){
       }
       if(response.status===401)return toast("Username atau password salah.");
       return toast(response.status===403?"Anda tidak memiliki izin untuk melakukan tindakan ini.":"Server belum dapat dihubungi.");
-    }catch{apiToken="";return toast(navigator.onLine?"Server belum dapat dihubungi.":"Koneksi internet terputus.");}
+    }catch{sessionGeneration++;apiToken="";sessionUser=null;return toast(navigator.onLine?"Server belum dapat dihubungi.":"Koneksi internet terputus.");}
   }
   toast("Aplikasi harus dijalankan melalui server.");
 }
 async function activateSession(user){
-  apiToken="cookie";sessionUser=user;
+  sessionGeneration++;apiToken="cookie";sessionUser=user;
   const remote=await getServerState();
   const hasRemoteState=Boolean(remote?.state&&Object.keys(remote.state).length);
   if(hasRemoteState)state=migrateState(remote.state,{log:true});
-  serverStateVersion=Number(remote?.version||0);lastSyncedState=clone(remote?.state||{});stateDirty=!hasRemoteState;syncErrorShown=false;
+  serverStateVersion=Number(remote?.version||0);serverStateRequestLimit=Number(remote?.maxRequestBytes||serverStateRequestLimit);lastSyncedState=clone(remote?.state||{});stateDirty=!hasRemoteState;syncErrorShown=false;syncFailureCount=0;
   state.currentUser=user.username;normalizeInMemoryState();showApp();if(stateDirty)queueServerSync();
 }
 async function restoreSession(){
@@ -304,7 +364,7 @@ async function restoreSession(){
     if(!response.ok)throw new Error("Server belum dapat memulihkan sesi.");
     await activateSession(await response.json());
   }catch(error){
-    apiToken="";sessionUser=null;
+    sessionGeneration++;apiToken="";sessionUser=null;
     if(error.name==="TimeoutError"||error.name==="AbortError")toast("Waktu tunggu server habis. Silakan login kembali.");
     else if(!navigator.onLine)toast("Koneksi internet terputus.");
   }finally{document.body.classList.remove("session-checking")}
@@ -318,7 +378,7 @@ function showApp(){
   goPage("dashboard");startServerRefresh();if(sessionUser?.level==="ADMINISTRATOR")loadUsers().catch(error=>toast(error.message));
 }
 function logout(){
-  fetch(`${API_BASE_URL}/auth/logout`,{method:"POST",credentials:"include"}).catch(()=>{});window.KASIR_REALTIME?.unsubscribe();state.currentUser=null;sessionUser=null;users=[];normalizeInMemoryState();apiToken="";serverStateVersion=null;lastSyncedState=null;stateDirty=false;clearInterval(serverRefreshTimer);$("#app").classList.add("hidden"); $("#loginScreen").classList.remove("hidden");
+  fetch(`${API_BASE_URL}/auth/logout`,{method:"POST",credentials:"include"}).catch(()=>{});sessionGeneration++;apiToken="";window.KASIR_REALTIME?.unsubscribe();syncController?.abort();syncController=null;syncInFlight=false;refreshController?.abort();refreshController=null;refreshInFlight=false;state.currentUser=null;sessionUser=null;users=[];normalizeInMemoryState();serverStateVersion=null;serverStateRequestLimit=512*1024;lastSyncedState=null;stateDirty=false;syncFailureCount=0;clearTimeout(serverSyncTimer);clearTimeout(serverRefreshTimer);$("#app").classList.add("hidden"); $("#loginScreen").classList.remove("hidden");
 }
 
 function goPage(name){
@@ -1013,8 +1073,8 @@ document.addEventListener("change",e=>{
 $("#modal").addEventListener("click",e=>{if(e.target.id==="modal")closeModal()});
 $("#loginForm").addEventListener("submit",e=>{});
 window.addEventListener("focus",()=>refreshServerState({notify:true}));
-window.addEventListener("online",()=>{syncErrorShown=false;if(stateDirty)queueServerSync();else refreshServerState({notify:true});});
-document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")refreshServerState({notify:true});});
+window.addEventListener("online",()=>{syncErrorShown=false;syncFailureCount=0;if(stateDirty)queueServerSync();else refreshServerState({notify:true});scheduleFallbackRefresh()});
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="hidden")clearTimeout(serverRefreshTimer);else{refreshServerState({notify:true});scheduleFallbackRefresh()}});
 $("#incomingDate").value=today();$("#stockDate").value=today();
 normalizeInMemoryState();
 

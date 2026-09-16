@@ -12,4 +12,13 @@ for (const file of frontendFiles) {
   const full = path.join(root, file);
   if (fs.statSync(full).isFile() && forbidden.test(fs.readFileSync(full, 'utf8'))) throw new Error(`Secret terdeteksi di ${file}`);
 }
+const appSource = fs.readFileSync(path.join(root, 'assets/js/app.js'), 'utf8');
+const serverSource = fs.readFileSync(path.join(root, 'server/app.js'), 'utf8');
+if (/setInterval\s*\(/.test(appSource)) throw new Error('Polling setInterval tidak boleh digunakan untuk sinkronisasi server.');
+for (const required of ['MAX_AUTOMATIC_SYNC_RETRIES', 'FALLBACK_REFRESH_MS = 30000', 'refreshInFlight', 'syncController', 'sessionGeneration']) {
+  if (!appSource.includes(required)) throw new Error(`Perlindungan sinkronisasi hilang: ${required}`);
+}
+for (const required of ['STATE_JSON_LIMIT', 'stateWriteLimiter', 'requestMetadataLog', 'requireJson']) {
+  if (!serverSource.includes(required)) throw new Error(`Perlindungan API hilang: ${required}`);
+}
 console.log('Pemeriksaan syntax dan secret frontend berhasil.');

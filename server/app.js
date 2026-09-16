@@ -10,6 +10,10 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const USER_FIELDS = 'id, username, role, active, created_at, updated_at';
+const SMALL_JSON_LIMIT = 8 * 1024;
+const configuredStateLimitKb = Number(process.env.STATE_JSON_LIMIT_KB || 512);
+const STATE_JSON_LIMIT_KB = Number.isSafeInteger(configuredStateLimitKb) && configuredStateLimitKb >= 64 && configuredStateLimitKb <= 1024 ? configuredStateLimitKb : 512;
+const STATE_JSON_LIMIT = STATE_JSON_LIMIT_KB * 1024;
 let runtime;
 let initialization;
 
@@ -23,6 +27,7 @@ function validateEnvironment() {
   if (missing.length) throw Object.assign(new Error(`Environment variable wajib belum diisi: ${missing.join(', ')}`), { status: 503 });
   if (process.env.JWT_SECRET.length < 32) throw Object.assign(new Error('JWT_SECRET harus memiliki minimal 32 karakter.'), { status: 503 });
   if (process.env.INITIAL_ADMIN_PASSWORD.length < 8) throw Object.assign(new Error('INITIAL_ADMIN_PASSWORD harus memiliki minimal 8 karakter.'), { status: 503 });
+  if (process.env.STATE_JSON_LIMIT_KB && Number(process.env.STATE_JSON_LIMIT_KB) !== STATE_JSON_LIMIT_KB) throw Object.assign(new Error('STATE_JSON_LIMIT_KB harus bilangan bulat antara 64 dan 1024.'), { status: 503 });
   let url;
   try { url = new URL(process.env.SUPABASE_URL); } catch { throw Object.assign(new Error('SUPABASE_URL tidak valid.'), { status: 503 }); }
   if (url.protocol !== 'https:') throw Object.assign(new Error('SUPABASE_URL wajib menggunakan HTTPS.'), { status: 503 });
@@ -76,10 +81,10 @@ function cookieToken(req) {
 }
 
 async function requireAuth(req, res, next) {
-  const { jwtSecret, supabase } = getRuntime();
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, '') || cookieToken(req);
   if (!token) return res.status(401).json({ message: 'Autentikasi diperlukan.' });
   try {
+    const { jwtSecret, supabase } = getRuntime();
     const claims = jwt.verify(token, jwtSecret, { algorithms: ['HS256'] });
     const { data: user, error } = await supabase.from('app_users').select(`${USER_FIELDS}, password_changed_at`).eq('id', claims.sub).maybeSingle();
     if (error) throw error;
@@ -101,16 +106,83 @@ const sessionCookieOptions = req => ({
   sameSite: 'lax',
   path: '/'
 });
-const hasSensitiveKey = value => {
-  if (!value || typeof value !== 'object') return false;
-  return Object.entries(value).some(([key, child]) => /password|password_hash|token|jwt|secret|supabase/i.test(key) || hasSensitiveKey(child));
-};
+function hasSensitiveKey(value) {
+  const pending = [value];
+  let inspected = 0;
+  while (pending.length) {
+    const current = pending.pop();
+    if (!current || typeof current !== 'object') continue;
+    if (++inspected > 100000) return true;
+    for (const [key, child] of Object.entries(current)) {
+      if (/password|password_hash|token|jwt|secret|supabase/i.test(key)) return true;
+      if (child && typeof child === 'object') pending.push(child);
+    }
+  }
+  return false;
+}
 function withoutSensitiveFields(value) {
   if (Array.isArray(value)) return value.map(withoutSensitiveFields);
   if (!value || typeof value !== 'object') return value;
   return Object.fromEntries(Object.entries(value).filter(([key]) => !/^(users|currentUser|password|password_hash|token|jwt|secret|supabase)$/i.test(key)).map(([key, child]) => [key, withoutSensitiveFields(child)]));
 }
-const validState = value => value && typeof value === 'object' && !Array.isArray(value) && ['products', 'suppliers', 'customers', 'transactions', 'incoming', 'stocktakes'].every(key => Array.isArray(value[key]));
+function validState(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const recordLists = ['products', 'suppliers', 'customers', 'transactions', 'incoming', 'stocktakes'];
+  if (!recordLists.every(key => Array.isArray(value[key]) && value[key].every(item => item && typeof item === 'object' && !Array.isArray(item)))) return false;
+  if (value.settings !== undefined && (!value.settings || typeof value.settings !== 'object' || Array.isArray(value.settings))) return false;
+  for (const key of ['categories', 'units', 'paymentMethods']) {
+    if (value[key] !== undefined && (!Array.isArray(value[key]) || value[key].some(item => typeof item !== 'string'))) return false;
+  }
+  return true;
+}
+
+function requireJson(req, res, next) {
+  if (req.is(['application/json', 'application/*+json'])) return next();
+  return res.status(415).json({ message: 'Content-Type wajib application/json.' });
+}
+
+function rejectOversizedBody(maxBytes) {
+  return (req, res, next) => {
+    const declaredBytes = Number(req.headers['content-length']);
+    if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) return res.status(413).json({ message: `Payload terlalu besar. Batas ${Math.floor(maxBytes / 1024)} KB.` });
+    return next();
+  };
+}
+
+function jsonParser(maxBytes) {
+  return express.json({
+    limit: maxBytes,
+    strict: true,
+    verify(req, _res, buffer) { req.requestBytes = buffer.length; }
+  });
+}
+
+const parseSmallJson = jsonParser(SMALL_JSON_LIMIT);
+const parseStateJson = jsonParser(STATE_JSON_LIMIT);
+const limiterResponse = { message: 'Terlalu banyak permintaan. Tunggu sebentar lalu coba lagi.' };
+const apiLimiter = rateLimit({ windowMs: 5 * 60 * 1000, limit: 300, standardHeaders: true, legacyHeaders: false, message: limiterResponse });
+const healthLimiter = rateLimit({ windowMs: 5 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false, message: limiterResponse });
+const stateReadLimiter = rateLimit({ windowMs: 5 * 60 * 1000, limit: 180, keyGenerator: req => `user:${req.user.id}`, standardHeaders: true, legacyHeaders: false, message: limiterResponse });
+const stateWriteLimiter = rateLimit({ windowMs: 5 * 60 * 1000, limit: 60, keyGenerator: req => `user:${req.user.id}`, standardHeaders: true, legacyHeaders: false, message: limiterResponse });
+const userWriteLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, keyGenerator: req => `user:${req.user.id}`, standardHeaders: true, legacyHeaders: false, message: limiterResponse });
+
+function requestMetadataLog(req, res, next) {
+  const startedAt = Date.now();
+  res.on('finish', () => {
+    const successfulRead = req.method === 'GET' && res.statusCode < 400;
+    if (successfulRead && Math.random() >= 0.1) return;
+    const headerBytes = Number(req.headers['content-length']);
+    console.info('API request', JSON.stringify({
+      method: req.method,
+      endpoint: req.originalUrl.split('?')[0],
+      status: res.statusCode,
+      requestBytes: Number.isFinite(req.requestBytes) ? req.requestBytes : (Number.isFinite(headerBytes) ? headerBytes : 0),
+      authenticated: Boolean(req.user),
+      durationMs: Date.now() - startedAt
+    }));
+  });
+  next();
+}
 
 function stateForCashier(payload) {
   const safe = structuredClone(payload);
@@ -183,10 +255,9 @@ app.use(cors({ credentials: true, origin(origin, callback) {
     return callback(Object.assign(new Error('Origin tidak diizinkan oleh CORS.'), { status: 403 }));
   } catch (error) { callback(error); }
 } }));
-app.use(express.json({ limit: '1mb' }));
-app.use('/api', ensureReady);
+app.use('/api', requestMetadataLog, apiLimiter, (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 
-app.get('/api/health', async (_req, res, next) => {
+app.get('/api/health', healthLimiter, ensureReady, async (_req, res, next) => {
   try {
     const { error } = await getRuntime().supabase.from('app_state').select('id').eq('id', 1).limit(1);
     if (error) throw error;
@@ -195,7 +266,7 @@ app.get('/api/health', async (_req, res, next) => {
 });
 
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false, message: { message: 'Terlalu banyak percobaan login. Coba kembali beberapa saat lagi.' } });
-app.post('/api/auth/login', loginLimiter, async (req, res, next) => {
+app.post('/api/auth/login', loginLimiter, requireJson, rejectOversizedBody(SMALL_JSON_LIMIT), parseSmallJson, ensureReady, async (req, res, next) => {
   try {
     const username = normalizeUsername(req.body?.username);
     const password = req.body?.password;
@@ -209,18 +280,18 @@ app.post('/api/auth/login', loginLimiter, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 app.post('/api/auth/logout', (req, res) => { res.clearCookie('kasir_session', sessionCookieOptions(req)); res.json({ ok: true }); });
-app.get('/api/auth/me', requireAuth, (req, res) => res.json(publicUser(req.user)));
+app.get('/api/auth/me', requireAuth, ensureReady, (req, res) => res.json(publicUser(req.user)));
 
-app.get('/api/state', requireAuth, async (req, res, next) => {
+app.get('/api/state', requireAuth, ensureReady, stateReadLimiter, async (req, res, next) => {
   try {
     const { data, error } = await getRuntime().supabase.from('app_state').select('payload, version, updated_at').eq('id', 1).maybeSingle();
     if (error) throw error;
     const payload = withoutSensitiveFields(data?.payload || {});
-    res.json({ state: req.user.role === 'ADMINISTRATOR' ? payload : stateForCashier(payload), version: Number(data?.version || 0), updatedAt: data?.updated_at || null });
+    res.json({ state: req.user.role === 'ADMINISTRATOR' ? payload : stateForCashier(payload), version: Number(data?.version || 0), updatedAt: data?.updated_at || null, maxRequestBytes: STATE_JSON_LIMIT });
   } catch (error) { next(error); }
 });
 
-app.put('/api/state', requireAuth, async (req, res, next) => {
+app.put('/api/state', requireJson, rejectOversizedBody(STATE_JSON_LIMIT), requireAuth, ensureReady, stateWriteLimiter, parseStateJson, async (req, res, next) => {
   try {
     let payload = req.body?.state;
     const expectedVersion = Number(req.body?.expectedVersion);
@@ -242,14 +313,14 @@ app.put('/api/state', requireAuth, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-app.get('/api/users', requireAuth, requireAdmin, async (_req, res, next) => {
+app.get('/api/users', requireAuth, ensureReady, requireAdmin, async (_req, res, next) => {
   try {
     const { data, error } = await getRuntime().supabase.from('app_users').select(USER_FIELDS).order('username');
     if (error) throw error;
     res.json(data.map(publicUser));
   } catch (error) { next(error); }
 });
-app.post('/api/users', requireAuth, requireAdmin, async (req, res, next) => {
+app.post('/api/users', requireJson, rejectOversizedBody(SMALL_JSON_LIMIT), requireAuth, ensureReady, requireAdmin, userWriteLimiter, parseSmallJson, async (req, res, next) => {
   try {
     const username = normalizeUsername(req.body?.username), password = req.body?.password, level = req.body?.level;
     if (!username || username.length > 80 || typeof password !== 'string' || password.length < 8 || !['ADMINISTRATOR', 'KASIR'].includes(level)) return res.status(400).json({ message: 'Username, level, atau password (minimal 8 karakter) tidak valid.' });
@@ -266,7 +337,7 @@ async function activeAdminCount() {
   if (error) throw error;
   return count || 0;
 }
-app.put('/api/users/:id', requireAuth, requireAdmin, async (req, res, next) => {
+app.put('/api/users/:id', requireJson, rejectOversizedBody(SMALL_JSON_LIMIT), requireAuth, ensureReady, requireAdmin, userWriteLimiter, parseSmallJson, async (req, res, next) => {
   try {
     const { supabase } = getRuntime();
     const { data: target, error: findError } = await supabase.from('app_users').select(USER_FIELDS).eq('id', req.params.id).maybeSingle();
@@ -282,7 +353,7 @@ app.put('/api/users/:id', requireAuth, requireAdmin, async (req, res, next) => {
     res.json(publicUser(data));
   } catch (error) { next(error); }
 });
-app.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res, next) => {
+app.delete('/api/users/:id', requireAuth, ensureReady, requireAdmin, userWriteLimiter, async (req, res, next) => {
   try {
     if (req.params.id === req.user.id) return res.status(400).json({ message: 'Anda tidak dapat menghapus akun sendiri.' });
     const { supabase } = getRuntime();
@@ -304,8 +375,8 @@ async function updatePassword(id, password) {
   if (error) throw error;
   if (!data) throw Object.assign(new Error('Pengguna tidak ditemukan.'), { status: 404 });
 }
-app.put('/api/users/:id/password', requireAuth, requireAdmin, async (req, res, next) => { try { await updatePassword(req.params.id, req.body?.password); res.json({ ok: true }); } catch (error) { next(error); } });
-app.put('/api/users/me/password', requireAuth, requireAdmin, async (req, res, next) => {
+app.put('/api/users/:id/password', requireJson, rejectOversizedBody(SMALL_JSON_LIMIT), requireAuth, ensureReady, requireAdmin, userWriteLimiter, parseSmallJson, async (req, res, next) => { try { await updatePassword(req.params.id, req.body?.password); res.json({ ok: true }); } catch (error) { next(error); } });
+app.put('/api/users/me/password', requireJson, rejectOversizedBody(SMALL_JSON_LIMIT), requireAuth, ensureReady, requireAdmin, userWriteLimiter, parseSmallJson, async (req, res, next) => {
   try {
     const { data: user, error } = await getRuntime().supabase.from('app_users').select('password_hash').eq('id', req.user.id).single();
     if (error) throw error;
@@ -315,11 +386,15 @@ app.put('/api/users/me/password', requireAuth, requireAdmin, async (req, res, ne
   } catch (error) { next(error); }
 });
 
-app.use((_req, res) => res.status(404).json({ message: 'Endpoint tidak ditemukan.' }));
+app.use('/api', (_req, res) => res.status(404).json({ message: 'Endpoint tidak ditemukan.' }));
 app.use((error, _req, res, _next) => {
   console.error('API error:', error.message, error.cause?.message || '');
-  const status = Number(error.status) || (error.code ? 503 : 500);
-  res.status(status).json({ message: status >= 500 ? (status === 503 ? 'Database atau konfigurasi server sedang tidak tersedia.' : 'Terjadi kesalahan pada server.') : error.message });
+  const malformedJson = error instanceof SyntaxError && error.status === 400 && 'body' in error;
+  const status = error.type === 'entity.too.large' ? 413 : (malformedJson ? 400 : (Number(error.status) || (error.code ? 503 : 500)));
+  const safeMessage = status === 413
+    ? `Payload terlalu besar. Batas ${Math.floor(STATE_JSON_LIMIT / 1024)} KB untuk state dan ${Math.floor(SMALL_JSON_LIMIT / 1024)} KB untuk permintaan lain.`
+    : (malformedJson ? 'JSON tidak valid.' : (status >= 500 ? (status === 503 ? 'Database atau konfigurasi server sedang tidak tersedia.' : 'Terjadi kesalahan pada server.') : error.message));
+  res.status(status).json({ message: safeMessage });
 });
 
 module.exports = app;

@@ -17,8 +17,8 @@ async function loadPages() {
 
     container.innerHTML = fragments.join("\n");
     await loadScript("assets/js/seed-data.js?v=20260717-1");
-    await loadScript("assets/js/realtime.js?v=20260717-1");
-    await loadScript("assets/js/app.js?v=20260717-38");
+    await loadScript("assets/js/realtime.js?v=20260916-1");
+    await loadScript("assets/js/app.js?v=20260916-1");
   } catch (error) {
     document.body.classList.remove("session-checking");
     container.innerHTML = `
