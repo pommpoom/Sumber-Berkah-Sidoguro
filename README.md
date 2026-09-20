@@ -31,7 +31,7 @@ Langkah deployment:
    | `SUPABASE_URL` | URL HTTPS project Supabase |
    | `SUPABASE_SECRET_KEY` | Secret/service-role key; hanya server |
    | `SUPABASE_ANON_KEY` | Publishable/anon key Supabase untuk notifikasi Realtime; aman berada di bundle frontend |
-   | `STATE_JSON_LIMIT_KB` | Opsional, default `512`; hanya naikkan setelah mengukur backup, maksimum `1024` |
+   | `STATE_JSON_LIMIT_KB` | Opsional, default `512`; hanya naikkan setelah mengukur backup, maksimum `2048` |
    | `CORS_ORIGIN` | URL production Vercel/custom domain, misalnya `https://web-kasir-sumber-berkah.vercel.app` |
    | `INITIAL_ADMIN_USERNAME` | Misalnya `ADMIN` |
    | `INITIAL_ADMIN_PASSWORD` | Password awal kuat, minimal 8 karakter |
@@ -70,7 +70,7 @@ Karena data operasional disimpan sebagai satu dokumen JSON, ukur backup sebelum 
 node -e "const fs=require('fs');const data=JSON.parse(fs.readFileSync('PATH-BACKUP.json','utf8'));console.log(Buffer.byteLength(JSON.stringify({state:data,expectedVersion:0})))"
 ```
 
-Jika hasilnya mendekati atau melebihi 524288 byte, set `STATE_JSON_LIMIT_KB` sedikit di atas kebutuhan (maksimum 1024), lalu rencanakan pengarsipan transaksi lama. Jangan menaikkan limit tanpa ukuran nyata.
+Jika hasilnya mendekati atau melebihi 524288 byte, set `STATE_JSON_LIMIT_KB` sedikit di atas kebutuhan (maksimum 2048), lalu rencanakan pengarsipan transaksi lama. Dengan state production saat ini sebesar 1.013.152 byte (sekitar 989 KB), nilai `1536` direkomendasikan agar tersedia ruang pertumbuhan tanpa membuka request hingga batas maksimum. Jangan menaikkan limit tanpa ukuran nyata.
 
 ## Pemeriksaan sebelum deploy
 

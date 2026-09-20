@@ -12,7 +12,7 @@ const app = express();
 const USER_FIELDS = 'id, username, role, active, created_at, updated_at';
 const SMALL_JSON_LIMIT = 8 * 1024;
 const configuredStateLimitKb = Number(process.env.STATE_JSON_LIMIT_KB || 512);
-const STATE_JSON_LIMIT_KB = Number.isSafeInteger(configuredStateLimitKb) && configuredStateLimitKb >= 64 && configuredStateLimitKb <= 1024 ? configuredStateLimitKb : 512;
+const STATE_JSON_LIMIT_KB = Number.isSafeInteger(configuredStateLimitKb) && configuredStateLimitKb >= 64 && configuredStateLimitKb <= 2048 ? configuredStateLimitKb : 512;
 const STATE_JSON_LIMIT = STATE_JSON_LIMIT_KB * 1024;
 let runtime;
 let initialization;
@@ -27,7 +27,7 @@ function validateEnvironment() {
   if (missing.length) throw Object.assign(new Error(`Environment variable wajib belum diisi: ${missing.join(', ')}`), { status: 503 });
   if (process.env.JWT_SECRET.length < 32) throw Object.assign(new Error('JWT_SECRET harus memiliki minimal 32 karakter.'), { status: 503 });
   if (process.env.INITIAL_ADMIN_PASSWORD.length < 8) throw Object.assign(new Error('INITIAL_ADMIN_PASSWORD harus memiliki minimal 8 karakter.'), { status: 503 });
-  if (process.env.STATE_JSON_LIMIT_KB && Number(process.env.STATE_JSON_LIMIT_KB) !== STATE_JSON_LIMIT_KB) throw Object.assign(new Error('STATE_JSON_LIMIT_KB harus bilangan bulat antara 64 dan 1024.'), { status: 503 });
+  if (process.env.STATE_JSON_LIMIT_KB && Number(process.env.STATE_JSON_LIMIT_KB) !== STATE_JSON_LIMIT_KB) throw Object.assign(new Error('STATE_JSON_LIMIT_KB harus bilangan bulat antara 64 dan 2048.'), { status: 503 });
   let url;
   try { url = new URL(process.env.SUPABASE_URL); } catch { throw Object.assign(new Error('SUPABASE_URL tidak valid.'), { status: 503 }); }
   if (url.protocol !== 'https:') throw Object.assign(new Error('SUPABASE_URL wajib menggunakan HTTPS.'), { status: 503 });
