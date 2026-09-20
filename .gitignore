@@ -4,6 +4,7 @@
 node_modules/
 dist/
 .vercel/
+.netlify/
 *.log
 .DS_Store
 assets/js/realtime.js

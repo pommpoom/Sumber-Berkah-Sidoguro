@@ -7,7 +7,8 @@ Object.assign(process.env, {
   CORS_ORIGIN: 'http://localhost:3000',
   INITIAL_ADMIN_USERNAME: 'ADMIN',
   INITIAL_ADMIN_PASSWORD: 'test-password',
-  NODE_ENV: 'development'
+  NODE_ENV: 'development',
+  STATE_JSON_LIMIT_KB: '512'
 });
 
 const app = require('../server/app');

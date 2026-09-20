@@ -38,14 +38,10 @@ function validateEnvironment() {
     if (!['http:', 'https:'].includes(parsedOrigin.protocol) || parsedOrigin.origin !== origin) throw Object.assign(new Error(`CORS_ORIGIN harus berupa origin HTTP(S) tanpa path: ${origin}`), { status: 503 });
     if (process.env.NODE_ENV === 'production' && parsedOrigin.protocol !== 'https:') throw Object.assign(new Error(`CORS_ORIGIN production wajib menggunakan HTTPS: ${origin}`), { status: 503 });
   }
-  const vercelOrigins = [process.env.VERCEL_URL, process.env.VERCEL_PROJECT_PRODUCTION_URL]
-    .map(value => String(value || '').trim().replace(/^https?:\/\//, ''))
-    .filter(Boolean)
-    .map(host => `https://${host}`);
   return {
     jwtSecret: process.env.JWT_SECRET,
     production: process.env.NODE_ENV === 'production',
-    origins: [...new Set([...configuredOrigins, ...vercelOrigins])],
+    origins: [...new Set(configuredOrigins)],
     supabase: createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY, { auth: { autoRefreshToken: false, persistSession: false } })
   };
 }
@@ -281,6 +277,14 @@ app.post('/api/auth/login', loginLimiter, requireJson, rejectOversizedBody(SMALL
 });
 app.post('/api/auth/logout', (req, res) => { res.clearCookie('kasir_session', sessionCookieOptions(req)); res.json({ ok: true }); });
 app.get('/api/auth/me', requireAuth, ensureReady, (req, res) => res.json(publicUser(req.user)));
+
+app.get('/api/state/version', requireAuth, stateReadLimiter, async (_req, res, next) => {
+  try {
+    const { data, error } = await getRuntime().supabase.from('app_state').select('version').eq('id', 1).maybeSingle();
+    if (error) throw error;
+    res.json({ version: Number(data?.version || 0) });
+  } catch (error) { next(error); }
+});
 
 app.get('/api/state', requireAuth, ensureReady, stateReadLimiter, async (req, res, next) => {
   try {

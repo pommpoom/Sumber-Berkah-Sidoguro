@@ -2,7 +2,7 @@
   "scripts": {
     "build": "node scripts/build.js",
     "check": "node scripts/check.js",
-    "test": "node scripts/http-security-test.js",
+    "test": "node scripts/http-security-test.js && node scripts/netlify-test.js && node scripts/state-refresh-test.js",
     "start": "npm run build && node server/index.js",
     "dev": "npm run build && node --watch server/index.js"
   },
@@ -18,6 +18,7 @@
     "jsonwebtoken": "^9.0.3",
     "lucide-react": "^1.24.0",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.7",
+    "serverless-http": "^4.0.0"
   }
 }
