@@ -203,8 +203,10 @@ function mergeCashierState(current, submitted, currentUserName) {
   const oldTransactions = new Map((current.transactions || []).map(transaction => [transaction.id || transaction.invoice, transaction]));
   const submittedTransactions = new Map((submitted.transactions || []).map(transaction => [transaction.id || transaction.invoice, transaction]));
   const additions = (submitted.transactions || []).filter(transaction => !oldTransactions.has(transaction.id || transaction.invoice)).map(transaction => {
+    if ((current.transactions || []).some(old => old.invoice === transaction.invoice)) throw Object.assign(new Error('Nomor transaksi sudah digunakan.'), { status: 409 });
     const items = (transaction.items || []).map(item => {
       const product = oldProducts.get(item.productId);
+      if (!product || !Number.isFinite(item.qty) || item.qty <= 0) throw Object.assign(new Error('Produk/qty tidak valid.'), { status: 400 });
       const costPrice = Number(product?.costPrice || 0);
       return { ...item, costPrice, profit: (Number(item.price || 0) - Number(item.discount || 0) - costPrice) * Number(item.qty || 0) };
     });
@@ -212,31 +214,42 @@ function mergeCashierState(current, submitted, currentUserName) {
   });
   const updatedExisting = (current.transactions || []).map(transaction => {
     const submittedTransaction = submittedTransactions.get(transaction.id || transaction.invoice);
-    if (!submittedTransaction || Number(transaction.remaining || 0) <= 0) return transaction;
+    if (submittedTransaction && JSON.stringify((submittedTransaction.items || []).map(item => [item.productId, Number(item.qty), Number(item.price), Number(item.discount || 0)])) !== JSON.stringify((transaction.items || []).map(item => [item.productId, Number(item.qty), Number(item.price), Number(item.discount || 0)]))) {
+      throw Object.assign(new Error('Hanya administrator dapat mengubah quantity transaksi.'), { status: 403 });
+    }
+    if (!submittedTransaction) return transaction;
     const existingPayments = Array.isArray(transaction.paymentHistory) ? transaction.paymentHistory : [];
     const existingIds = new Set(existingPayments.map(payment => String(payment.id || '')));
-    let remaining = Math.max(0, Number(transaction.remaining || 0));
+    const isDP = String(transaction.paymentMethod || '').trim().toUpperCase() === 'DP';
+    const initialPaid = isDP ? Number(transaction.downPayment || 0) : Number(transaction.cashIn ?? Number(transaction.payment ?? transaction.total ?? 0) - Number(transaction.change || 0));
+    let remaining = Math.max(0, Number(transaction.total || 0) - initialPaid - existingPayments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0));
     const acceptedPayments = [];
     for (const payment of Array.isArray(submittedTransaction.paymentHistory) ? submittedTransaction.paymentHistory : []) {
-      if (!payment || existingIds.has(String(payment.id || '')) || remaining <= 0) continue;
-      const amount = Math.min(remaining, Math.max(0, Number(payment.amount || 0)));
+      if (!payment || existingIds.has(String(payment.id || ''))) continue;
+      const amount = Number(payment.amount);
+      if (!Number.isFinite(amount) || amount <= 0 || amount > remaining) throw Object.assign(new Error('Nominal pelunasan tidak valid.'), { status: 400 });
       const date = String(payment.date || '').slice(0, 10);
       const method = String(payment.method || '').trim();
-      if (!amount || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !method) continue;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !method || method.toUpperCase() === 'DP' || !payment.id) throw Object.assign(new Error('Data pelunasan tidak valid.'), { status: 400 });
       acceptedPayments.push({ id: String(payment.id || `${transaction.invoice}-PAY-${Date.now()}-${acceptedPayments.length}`), date, method, amount, createdAt: payment.createdAt || new Date().toISOString(), cashier: currentUserName, note: String(payment.note || '').trim() });
+      existingIds.add(String(payment.id || ''));
       remaining -= amount;
     }
     if (!acceptedPayments.length) return transaction;
     const paymentHistory = [...existingPayments, ...acceptedPayments];
     const settlementTotal = paymentHistory.reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
     const total = Number(transaction.total || 0);
-    const paid = Math.min(total, Number(transaction.downPayment || 0) + settlementTotal);
-    return { ...transaction, paymentHistory, payment: paid, cashIn: transaction.paymentMethod === 'DP' ? Number(transaction.downPayment || 0) : paid, remaining: Math.max(0, total - paid), paymentStatus: paid >= total ? 'LUNAS' : 'BELUM LUNAS' };
+    const paid = Math.min(total, initialPaid + settlementTotal);
+    return { ...transaction, paymentMethod: isDP ? 'DP' : transaction.paymentMethod, paymentHistory, payment: isDP ? paid : transaction.payment, cashIn: initialPaid, remaining: Math.max(0, total - paid), paymentStatus: paid >= total ? 'LUNAS' : 'BELUM LUNAS' };
   });
   merged.transactions = [...additions, ...updatedExisting];
   const soldByProduct = new Map();
   additions.forEach(transaction => transaction.items.forEach(item => soldByProduct.set(item.productId, (soldByProduct.get(item.productId) || 0) + Math.max(0, Number(item.qty || 0)))));
-  merged.products = (current.products || []).map(product => ({ ...product, stock: Math.max(0, Number(product.stock || 0) - (soldByProduct.get(product.id) || 0)) }));
+  merged.products = (current.products || []).map(product => {
+    const stock = Number(product.stock || 0) - (product.trackStock ? soldByProduct.get(product.id) || 0 : 0);
+    if (product.trackStock && stock < 0) throw Object.assign(new Error('Stok tidak mencukupi.'), { status: 400 });
+    return { ...product, stock };
+  });
   return merged;
 }
 
@@ -303,8 +316,9 @@ app.put('/api/state', requireJson, rejectOversizedBody(STATE_JSON_LIMIT), requir
     if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0) return res.status(400).json({ message: 'Versi state tidak valid.' });
     const { supabase } = getRuntime();
     if (req.user.role !== 'ADMINISTRATOR') {
-      const { data: current, error: readError } = await supabase.from('app_state').select('payload').eq('id', 1).single();
+      const { data: current, error: readError } = await supabase.from('app_state').select('payload, version').eq('id', 1).single();
       if (readError) throw readError;
+      if (Number(current.version) !== expectedVersion) return res.status(409).json({ message: 'Data telah berubah di perangkat lain.' });
       payload = mergeCashierState(current.payload || {}, payload, req.user.username);
     }
     delete payload.users;
@@ -379,7 +393,6 @@ async function updatePassword(id, password) {
   if (error) throw error;
   if (!data) throw Object.assign(new Error('Pengguna tidak ditemukan.'), { status: 404 });
 }
-app.put('/api/users/:id/password', requireJson, rejectOversizedBody(SMALL_JSON_LIMIT), requireAuth, ensureReady, requireAdmin, userWriteLimiter, parseSmallJson, async (req, res, next) => { try { await updatePassword(req.params.id, req.body?.password); res.json({ ok: true }); } catch (error) { next(error); } });
 app.put('/api/users/me/password', requireJson, rejectOversizedBody(SMALL_JSON_LIMIT), requireAuth, ensureReady, requireAdmin, userWriteLimiter, parseSmallJson, async (req, res, next) => {
   try {
     const { data: user, error } = await getRuntime().supabase.from('app_users').select('password_hash').eq('id', req.user.id).single();
@@ -389,6 +402,8 @@ app.put('/api/users/me/password', requireJson, rejectOversizedBody(SMALL_JSON_LI
     res.json({ ok: true });
   } catch (error) { next(error); }
 });
+
+app.put('/api/users/:id/password', requireJson, rejectOversizedBody(SMALL_JSON_LIMIT), requireAuth, ensureReady, requireAdmin, userWriteLimiter, parseSmallJson, async (req, res, next) => { try { await updatePassword(req.params.id, req.body?.password); res.json({ ok: true }); } catch (error) { next(error); } });
 
 app.use('/api', (_req, res) => res.status(404).json({ message: 'Endpoint tidak ditemukan.' }));
 app.use((error, _req, res, _next) => {
