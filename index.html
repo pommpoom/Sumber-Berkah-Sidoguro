@@ -6,7 +6,7 @@
   <meta name="description" content="Aplikasi kasir, stok dan pencatatan transaksi Sumber Berkah Sidoguro">
   <link rel="icon" href="assets/images/logo-sbs.svg">
   <title>Sumber Berkah Sidoguro</title>
-  <link rel="stylesheet" href="assets/css/main.css?v=20260717-19">
+  <link rel="stylesheet" href="assets/css/main.css?v=20261022-1">
 </head>
 <body class="session-checking">
   <div id="loginScreen" class="login-screen">
@@ -20,6 +20,7 @@
         <input id="loginPassword" type="password" autocomplete="current-password" required>
       </label>
       <button class="button blue wide" type="submit">Login</button>
+      <button id="retryLogoutBtn" class="button outline hidden" type="button">Logout server belum terkonfirmasi — coba lagi</button>
     </form>
   </div>
 
@@ -48,6 +49,7 @@
         <span id="pageHeadingIcon" class="page-heading-icon">🛒</span>
         <div><h1 id="pageHeadingTitle">TRANSAKSI KASIR</h1><p id="pageHeadingDescription">Kelola transaksi penjualan toko</p></div>
       </div>
+      <div id="saveStatus" class="save-status" role="status" hidden><span></span> <button id="retrySaveBtn" type="button" hidden>Coba lagi</button></div>
       <div id="pageContainer" aria-live="polite"></div>
     </main>
     <button id="sidebarBackdrop" class="sidebar-backdrop" type="button" aria-label="Tutup navigasi"></button>
@@ -61,7 +63,7 @@
   </div>
   <div id="toast" class="toast"></div>
 
-  <script src="assets/js/sidebar.js?v=20260717-5"></script>
-  <script src="assets/js/page-loader.js?v=20260916-1"></script>
+  <script src="assets/js/sidebar.js?v=20261022-1"></script>
+  <script src="assets/js/page-loader.js?v=20261022-1"></script>
 </body>
 </html>

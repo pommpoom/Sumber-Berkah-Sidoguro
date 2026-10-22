@@ -20,7 +20,7 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
 function browser() {
   const requests = [], replies = [], timers = new Map(), events = new Map();
   let timerId = 0, connected = false, onChange, onStatus;
-  const element = { classList: { contains: () => false, add() {}, remove() {} } };
+  const element = { querySelector: () => ({}), toggleAttribute() {}, classList: { contains: () => false, add() {}, remove() {} } };
   const context = vm.createContext({
     location: { hostname: 'cashier.example.test', port: '', protocol: 'https:' },
     document: { visibilityState: 'visible', querySelector: () => element, addEventListener: (name, callback) => events.set(name, callback) },
@@ -33,7 +33,7 @@ function browser() {
       }
     },
     navigator: { onLine: true }, AbortController, Blob,
-    AbortSignal: { any: AbortSignal.any.bind(AbortSignal) },
+    AbortSignal: { timeout: AbortSignal.timeout.bind(AbortSignal), any: AbortSignal.any.bind(AbortSignal) },
     setTimeout(callback, delay) { timers.set(++timerId, { callback, delay }); return timerId; },
     clearTimeout(id) { timers.delete(id); },
     async fetch(url, options) {
@@ -49,6 +49,7 @@ function browser() {
     apiToken="cookie";sessionUser={id:"same-user"};sessionGeneration=1;
     state={products:[],currentUser:"ADMIN"};serverStateVersion=1;
     migrateState=value=>value;normalizeInMemoryState=()=>{};renderAll=()=>{};toast=()=>{};
+    loadState=()=>({products:[],currentUser:null});
   `);
   return {
     evaluate, context, requests, replies, timers,

@@ -36,8 +36,9 @@ const menuItems = [
 
 function SidebarMenu() {
   useEffect(() => {
+    window.dispatchEvent(new Event("navigation-ready"));
     const handleKeyboardNavigation = event => {
-      const buttons = [...navigation.querySelectorAll("button")];
+      const buttons = [...navigation.querySelectorAll("button:not(.hidden)")];
       const currentIndex = buttons.indexOf(document.activeElement);
       if (currentIndex < 0 || !["ArrowDown", "ArrowUp", "ArrowRight", "ArrowLeft", "Home", "End"].includes(event.key)) return;
 

@@ -30,6 +30,8 @@ let refreshController = null;
 let pendingRealtimeRefresh = null;
 let syncFailureCount = 0;
 let sessionGeneration = 0;
+let criticalSave = null;
+let logoutRequest = null;
 const SYNC_DEBOUNCE_MS = 1000;
 const SYNC_RETRY_BASE_MS = 2000;
 const MAX_AUTOMATIC_SYNC_RETRIES = 5;
@@ -46,6 +48,17 @@ const nowLocal = () => {
 };
 const esc = v => String(v??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));
 const timeoutSignal = () => typeof AbortSignal!=="undefined"&&typeof AbortSignal.timeout==="function"?AbortSignal.timeout(15000):undefined;
+function requestSignal(controller){
+  const timeout=timeoutSignal();
+  if(timeout&&typeof AbortSignal.any==="function")return AbortSignal.any([controller.signal,timeout]);
+  // Older browsers still get a deadline without turning a timeout into logout cancellation.
+  const combined=new AbortController(),timer=setTimeout(()=>combined.abort(),15000);
+  const cancel=()=>{clearTimeout(timer);combined.abort()};
+  controller.signal.addEventListener("abort",cancel,{once:true});
+  if(controller.signal.aborted)cancel();
+  combined.signal.dispose=()=>{clearTimeout(timer);controller.signal.removeEventListener("abort",cancel)};
+  return combined.signal;
+}
 
 function toSafeNumber(value,fallback=0){const result=Number(value);return Number.isFinite(result)?result:fallback}
 function normalizedText(value){return String(value??"").trim().replace(/\s+/g," ").toUpperCase()}
@@ -64,10 +77,13 @@ function findMatchingProduct(productName,products=state?.products||[]){
 }
 
 async function apiRequest(path,options={}){
+  const generation=sessionGeneration;
   try{
     const response=await fetch(`${API_BASE_URL}${path}`,{credentials:"include",signal:timeoutSignal(),...options,headers:{...(options.body?{"Content-Type":"application/json"}:{}),...(options.headers||{})}});
+    if(generation!==sessionGeneration)throw new Error("Permintaan sesi lama diabaikan.");
     if(response.status===401){if(apiToken)logout();throw new Error("Sesi Anda telah berakhir. Silakan login kembali.")}
     const body=response.status===204?null:await response.json().catch(()=>null);
+    if(generation!==sessionGeneration)throw new Error("Permintaan sesi lama diabaikan.");
     if(!response.ok)throw new Error(body?.message||(response.status===403?"Anda tidak memiliki izin untuk melakukan tindakan ini.":"Permintaan tidak dapat diproses."));
     return body;
   }catch(error){
@@ -76,12 +92,15 @@ async function apiRequest(path,options={}){
     throw error;
   }
 }
-async function loadUsers(){if(currentUser()?.level!=="ADMINISTRATOR")return;users=await apiRequest("/users");renderUsers()}
+async function loadUsers(){if(currentUser()?.level!=="ADMINISTRATOR")return;const generation=sessionGeneration,result=await apiRequest("/users");if(generation!==sessionGeneration||!apiToken)return;users=result;renderUsers()}
 
 function calculateItemAmount(price,discount,qty){return Math.max(0,(Number(price)||0)-Math.max(0,Number(discount)||0))*Math.max(0,Number(qty)||0)}
 function calculateItemNetPrice(price,discount){return calculateItemAmount(price,discount,1)}
 function transactionSettlementTotal(transaction){return (transaction.paymentHistory||[]).reduce((sum,payment)=>sum+Number(payment.amount||0),0)}
-function getTransactionPaidTotal(transaction){return Math.min(Number(transaction.total||0),Number(transaction.paymentMethod==="DP"?transaction.downPayment||0:transaction.payment||transaction.cashIn||transaction.total||0)+transactionSettlementTotal(transaction))}
+function getTransactionReceived(transaction){return Number(transaction.paymentMethod==="DP"?transaction.downPayment||0:transaction.cashIn??Math.max(0,Number(transaction.payment??transaction.total??0)-Number(transaction.change||0)))+transactionSettlementTotal(transaction)}
+function getTransactionPaidTotal(transaction){return Math.min(Number(transaction.total||0),getTransactionReceived(transaction))}
+function settlementLabel(transaction){return transaction.paymentMethod==="DP"?"Bayar Sisa DP":"Bayar Sisa"}
+function canSettleTransaction(transaction){return hasPermission("transactions-settle")&&Number(transaction.total||0)-getTransactionReceived(transaction)>0}
 function getInitialTransactionCashIn(transaction){return Number((transaction.cashIn??(transaction.paymentMethod==="DP"?transaction.downPayment:transaction.total))||0)}
 function getTransactionCashIn(transaction){return getTransactionPaidTotal(transaction)}
 function getTransactionCashInOnDate(transaction,date){
@@ -98,6 +117,7 @@ function getTransactionPaymentsOnDate(transaction,date){
 function getPaymentStatus(transaction){return Number(transaction.remaining||0)>0?"BELUM LUNAS":"LUNAS"}
 function normalizeTransaction(transaction){
   const t={...transaction};
+  if(normalizedText(t.paymentMethod)==="DP")t.paymentMethod="DP";
   t.items=Array.isArray(t.items)?t.items.map((item,index)=>{
     const i={...item}; i.lineId=i.lineId||`${t.invoice||t.id||"TX"}-${index+1}`;
     i.price=toSafeNumber(i.price); i.discount=Math.max(0,toSafeNumber(i.discount)); i.qty=Math.max(0,toSafeNumber(i.qty)); i.costPrice=toSafeNumber(i.costPrice);
@@ -109,11 +129,12 @@ function normalizeTransaction(transaction){
   t.discountPercent=toSafeNumber(t.discountPercent??(t.subtotal? t.discountAmount/t.subtotal*100:0));
   t.taxPercent=toSafeNumber(t.taxPercent); t.taxAmount=toSafeNumber(t.taxAmount??Math.max(0,t.subtotal-t.discountAmount)*t.taxPercent/100);
   t.total=toSafeNumber(t.total??(t.subtotal-t.discountAmount+t.taxAmount));
-  t.downPayment=Math.max(0,toSafeNumber(t.downPayment)); t.payment=toSafeNumber(t.payment); t.change=Math.max(0,toSafeNumber(t.change));
+  t.downPayment=Math.max(0,toSafeNumber(t.downPayment)); t.payment=toSafeNumber(t.payment??t.total); t.change=Math.max(0,toSafeNumber(t.change));
   t.paymentHistory=Array.isArray(t.paymentHistory)?t.paymentHistory.map((payment,index)=>({id:payment.id||`${t.invoice||t.id||"TX"}-PAY-${index+1}`,date:String(payment.date||payment.createdAt||today()).slice(0,10),method:payment.method||"Tunai",amount:Math.max(0,toSafeNumber(payment.amount)),createdAt:payment.createdAt||new Date().toISOString(),cashier:payment.cashier||"",note:payment.note||""})).filter(payment=>payment.amount>0):[];
   if(t.paymentMethod==="DP")t.payment=getTransactionPaidTotal(t);
-  t.remaining=Math.max(0,t.paymentMethod==="DP"?t.total-getTransactionPaidTotal(t):toSafeNumber(t.remaining??0));
-  t.cashIn=t.paymentMethod==="DP"?t.downPayment:getTransactionPaidTotal(t); t.paymentStatus=getPaymentStatus(t);
+  t.remaining=Math.max(0,t.total-getTransactionPaidTotal(t));
+  t.cashIn=t.paymentMethod==="DP"?t.downPayment:toSafeNumber(t.cashIn??Math.max(0,t.payment-t.change));
+  t.refundDue=Math.max(0,getTransactionReceived(t)-t.total);t.paymentStatus=getPaymentStatus(t);
   return t;
 }
 function normalizeState(raw){
@@ -178,11 +199,53 @@ async function getServerStateVersion(signal){
   return body.version;
 }
 function showSyncError(message){if(!syncErrorShown){syncErrorShown=true;toast(message)}}
+function criticalStatus(message,retry=false){
+  const banner=$("#saveStatus");
+  if(!banner)return;
+  banner.hidden=!message;
+  banner.querySelector("span").textContent=message;
+  banner.querySelector("button").hidden=!retry;
+}
+function lockCriticalForm(locked){
+  $("#pageContainer")?.toggleAttribute("inert",locked);
+  $("#modalBody")?.toggleAttribute("inert",locked);
+  $("#modalClose")?.toggleAttribute("disabled",locked);
+}
+// Critical operations use the existing debounced writer. Their identity and snapshot
+// stay unchanged on ambiguous network failures, including a lost successful response.
+function saveStateAndWaitForConfirmation(key,apply,confirmed){
+  if(criticalSave)return criticalSave.promise;
+  if(!apiToken||stateDirty||syncInFlight){toast("Tunggu sinkronisasi sebelumnya selesai sebelum menyimpan.");return Promise.resolve(false)}
+  const before=clone(state),id=nextId("SAVE");
+  try{apply(id)}catch(error){state=before;toast(error.message);return Promise.resolve(false)}
+  let resolve;
+  const promise=new Promise(done=>{resolve=done});
+  criticalSave={key,id,before,confirmed,promise,resolve};
+  lockCriticalForm(true);criticalStatus("Menyimpan — menunggu konfirmasi server. Jangan tutup halaman.");
+  saveState();
+  return promise;
+}
+function finishCriticalSave(success,message=""){
+  const operation=criticalSave;if(!operation)return;
+  criticalSave=null;lockCriticalForm(false);criticalStatus(message);
+  operation.resolve(success);
+  if(success)operation.confirmed();
+}
+function hasOperation(payload,id){
+  return [...(payload.transactions||[]),...(payload.incoming||[])].some(record=>
+    record.saveOperationId===id||(record.quantityEdits||[]).some(edit=>edit.id===id)||(record.paymentHistory||[]).some(payment=>payment.id===id));
+}
+function retryCriticalSave(){
+  if(!criticalSave||syncInFlight)return;
+  syncFailureCount=0;syncErrorShown=false;
+  criticalStatus("Mencoba ulang penyimpanan yang sama — menunggu server.");
+  queueServerSync();
+}
 async function syncServerState(){
   if(!apiToken||location.protocol==="file:"||syncInFlight||!stateDirty)return;
   syncInFlight=true;
   const activeGeneration=sessionGeneration,controller=new AbortController();syncController=controller;
-  const timeout=timeoutSignal(),signal=typeof AbortSignal.any==="function"?AbortSignal.any([controller.signal,...(timeout?[timeout]:[])]):controller.signal;
+  const signal=requestSignal(controller);
   let retryDelay=null,saveNewerState=false;
   try{
     for(let attempts=0;attempts<3&&stateDirty;attempts++){
@@ -197,6 +260,13 @@ async function syncServerState(){
         const remote=await getServerState(signal);
         if(activeGeneration!==sessionGeneration||!apiToken)return;
         const currentUser=state.currentUser;
+        if(criticalSave){
+          const persisted=hasOperation(remote.state||{},criticalSave.id);
+          state=migrateState(remote.state||{});state.currentUser=currentUser;
+          serverStateVersion=Number(remote.version||0);lastSyncedState=statePayload();stateDirty=false;
+          finishCriticalSave(persisted,persisted?"":"Data berubah di perangkat lain. Input tetap tersedia; periksa stok/total lalu simpan kembali.");
+          renderAll();return;
+        }
         state=migrateState(mergeValue(lastSyncedState||remote.state||{},payload,remote.state||{}),{log:true});
         state.currentUser=currentUser;normalizeInMemoryState();serverStateVersion=Number(remote.version||0);serverStateRequestLimit=Number(remote.maxRequestBytes||serverStateRequestLimit);lastSyncedState=clone(remote.state||{});stateDirty=true;continue;
       }
@@ -207,8 +277,11 @@ async function syncServerState(){
         throw error;
       }
       const saved=await response.json();
-      if(activeGeneration!==sessionGeneration||!apiToken||signal.aborted)return;
+      if(activeGeneration!==sessionGeneration||!apiToken||controller.signal.aborted)return;
+      if(signal.aborted)throw new Error("Waktu tunggu konfirmasi server habis.");
+      if(!Number.isSafeInteger(saved?.version)||saved.version<=Number(serverStateVersion||0))throw new Error("Konfirmasi versi server tidak valid.");
       serverStateVersion=Number(saved.version);lastSyncedState=clone(payload);stateDirty=!sameValue(payload,statePayload());syncFailureCount=0;syncErrorShown=false;
+      if(!stateDirty&&criticalSave)finishCriticalSave(true);
       saveNewerState=stateDirty;
     }
     if(stateDirty&&!saveNewerState){
@@ -224,7 +297,12 @@ async function syncServerState(){
       if(syncFailureCount<=MAX_AUTOMATIC_SYNC_RETRIES)retryDelay=error.retryAfter||Math.min(30000,SYNC_RETRY_BASE_MS*2**(syncFailureCount-1));
     }
     showSyncError(retryable?`${error.message||"Sinkronisasi gagal."} Percobaan ulang dibatasi.`:error.message||"Data ditolak server dan tidak akan dikirim ulang otomatis.");
+    if(criticalSave){
+      if(!retryable){state=criticalSave.before;stateDirty=false;finishCriticalSave(false,error.message);}
+      else criticalStatus(`${error.message||"Koneksi gagal."} Penyimpanan belum terkonfirmasi. ${retryDelay===null?"Klik Coba lagi; jangan buat transaksi baru.":"Menunggu percobaan ulang otomatis."}`,retryDelay===null);
+    }
   }finally{
+    signal.dispose?.();
     const ownsSync=syncController===controller;
     if(ownsSync){syncController=null;syncInFlight=false}
     if(ownsSync&&activeGeneration===sessionGeneration&&stateDirty&&apiToken){
@@ -251,10 +329,10 @@ function flushPendingRealtimeRefresh(activeGeneration){
 async function refreshServerState({notify=false,version}={}){
   if(!apiToken||stateDirty||syncInFlight||refreshInFlight||document.visibilityState==="hidden"||$("#modal")?.classList.contains("open"))return;
   const hasEventVersion=Number.isSafeInteger(version)&&version>=0;
-  if(hasEventVersion&&version===serverStateVersion)return;
+  if(hasEventVersion&&version<=serverStateVersion)return;
   refreshInFlight=true;
   const activeGeneration=sessionGeneration,activeUserId=sessionUser?.id,controller=new AbortController();refreshController=controller;
-  const timeout=timeoutSignal(),signal=typeof AbortSignal.any==="function"?AbortSignal.any([controller.signal,...(timeout?[timeout]:[])]):controller.signal;
+  const signal=requestSignal(controller);
   const stillCurrent=()=>activeGeneration===sessionGeneration&&apiToken&&sessionUser?.id===activeUserId&&!signal.aborted&&!stateDirty&&!syncInFlight&&document.visibilityState!=="hidden"&&!$("#modal")?.classList.contains("open");
   try{
     const remoteVersionHint=hasEventVersion?version:await getServerStateVersion(signal);
@@ -263,7 +341,7 @@ async function refreshServerState({notify=false,version}={}){
     const remote=await getServerState(signal),remoteVersion=Number(remote.version||0);
     if(!stillCurrent())return;
     serverStateRequestLimit=Number(remote.maxRequestBytes||serverStateRequestLimit);
-    if(serverStateVersion===null||remoteVersion!==serverStateVersion){
+    if(serverStateVersion===null||remoteVersion>serverStateVersion){
       const currentUser=state.currentUser;state=migrateState(remote.state||{}, {log:true});state.currentUser=currentUser;normalizeInMemoryState();serverStateVersion=remoteVersion;lastSyncedState=statePayload();renderAll();if(notify)toast("Data terbaru dari server telah dimuat.");
     }
     syncErrorShown=false;
@@ -272,6 +350,7 @@ async function refreshServerState({notify=false,version}={}){
     if(error.message==="Sesi login berakhir."){logout();toast("Sesi berakhir. Silakan login kembali.");return}
     showSyncError(error.message||"Data server tidak dapat dimuat.");
   }finally{
+    signal.dispose?.();
     if(refreshController===controller){
       refreshController=null;refreshInFlight=false;
       if(!signal.aborted)flushPendingRealtimeRefresh(activeGeneration);
@@ -292,7 +371,7 @@ function startServerRefresh(){
     version=>{
       if(activeGeneration!==sessionGeneration||!apiToken)return;
       const options={notify:true,version};
-      if(refreshInFlight||syncInFlight||stateDirty)pendingRealtimeRefresh=options;else refreshServerState(options);
+      if(refreshInFlight||syncInFlight||stateDirty||document.visibilityState==="hidden"||$("#modal")?.classList.contains("open"))pendingRealtimeRefresh=options;else refreshServerState(options);
     },
     connected=>{if(activeGeneration!==sessionGeneration)return;if(connected)clearTimeout(serverRefreshTimer);else scheduleFallbackRefresh()}
   );
@@ -308,7 +387,7 @@ function toast(t){
 function openModal(title,body){
   $("#modalTitle").textContent=title; $("#modalBody").innerHTML=body; $("#modal").classList.add("open");
 }
-function closeModal(){ $("#modal").classList.remove("open"); quickAddTarget=""; }
+function closeModal(){ if(criticalSave)return;$("#modal").classList.remove("open"); quickAddTarget="";flushPendingRealtimeRefresh(sessionGeneration); }
 function uniqueSuffix(){return crypto.randomUUID?.().replaceAll("-","")||`${Date.now().toString(36)}${Math.random().toString(36).slice(2,10)}`}
 function nextId(prefix){return `${prefix}-${uniqueSuffix()}`}
 function nextInvoice(){
@@ -326,9 +405,10 @@ function productById(id){return state.products.find(p=>p.id===id)}
 function productByName(name){return state.products.find(p=>p.name===name)}
 function currentUser(){return sessionUser}
 function hasPermission(permission){
+  if(!sessionUser)return false;
   const level=currentUser()?.level||"KASIR";
   if(level==="ADMINISTRATOR")return true;
-  return ["cashier","products-view","transactions-view","print"].includes(permission);
+  return ["cashier","transactions-settle","products-view","transactions-view","print"].includes(permission);
 }
 function requirePermission(permission){if(hasPermission(permission))return true;toast("Akses ini hanya untuk ADMINISTRATOR.");return false}
 function calculateTransactionTotals(items,discountInput=0){
@@ -370,53 +450,86 @@ function restoreData(file){
 }
 
 async function login(username,password){
+  if(logoutRequest){toast("Menunggu konfirmasi logout server. Coba login kembali sebentar lagi.");return}
+  const generation=sessionGeneration;
   if(location.protocol!=="file:"){
     try{
       const response=await fetch(`${API_BASE_URL}/auth/login`,{method:"POST",credentials:"include",signal:timeoutSignal(),headers:{"Content-Type":"application/json"},body:JSON.stringify({username,password})});
       if(response.ok){
-        const session=await response.json();await activateSession(session.user);return;
+        const session=await response.json();if(generation!==sessionGeneration)return;await activateSession(session.user);return;
       }
       if(response.status===401)return toast("Username atau password salah.");
       return toast(response.status===403?"Anda tidak memiliki izin untuk melakukan tindakan ini.":"Server belum dapat dihubungi.");
-    }catch{sessionGeneration++;apiToken="";sessionUser=null;return toast(navigator.onLine?"Server belum dapat dihubungi.":"Koneksi internet terputus.");}
+    }catch{if(generation!==sessionGeneration)return;sessionGeneration++;apiToken="";sessionUser=null;return toast(navigator.onLine?"Server belum dapat dihubungi.":"Koneksi internet terputus.");}
   }
   toast("Aplikasi harus dijalankan melalui server.");
 }
 async function activateSession(user){
   sessionGeneration++;apiToken="cookie";sessionUser=user;
-  const remote=await getServerState();
+  const generation=sessionGeneration;
+  let remote;
+  try{remote=await getServerState()}catch(error){if(generation===sessionGeneration){apiToken="";sessionUser=null;toast(error.message)}throw error}
+  if(generation!==sessionGeneration||!apiToken)return;
   const hasRemoteState=Boolean(remote?.state&&Object.keys(remote.state).length);
   if(hasRemoteState)state=migrateState(remote.state,{log:true});
   serverStateVersion=Number(remote?.version||0);serverStateRequestLimit=Number(remote?.maxRequestBytes||serverStateRequestLimit);lastSyncedState=clone(remote?.state||{});stateDirty=!hasRemoteState;syncErrorShown=false;syncFailureCount=0;
   state.currentUser=user.username;normalizeInMemoryState();showApp();if(stateDirty)queueServerSync();
 }
 async function restoreSession(){
+  const generation=sessionGeneration;
   if(location.protocol==="file:"){document.body.classList.remove("session-checking");return}
   try{
     const response=await fetch(`${API_BASE_URL}/auth/me`,{credentials:"include",signal:timeoutSignal(),cache:"no-store"});
     if(response.status===401)return;
     if(!response.ok)throw new Error("Server belum dapat memulihkan sesi.");
-    await activateSession(await response.json());
+    const user=await response.json();if(generation!==sessionGeneration)return;await activateSession(user);
   }catch(error){
+    if(generation!==sessionGeneration)return;
     sessionGeneration++;apiToken="";sessionUser=null;
     if(error.name==="TimeoutError"||error.name==="AbortError")toast("Waktu tunggu server habis. Silakan login kembali.");
     else if(!navigator.onLine)toast("Koneksi internet terputus.");
   }finally{document.body.classList.remove("session-checking")}
 }
 function showApp(){
+  clearCashier();
+  if(!$("#incomingDate").value)$("#incomingDate").value=today();
   $("#loginScreen").classList.add("hidden"); $("#app").classList.remove("hidden");
   $("#activeUser").textContent=state.currentUser || "-";
+  updateNavigationPermissions();
+  goPage("dashboard");startServerRefresh();if(sessionUser?.level==="ADMINISTRATOR")loadUsers().catch(error=>toast(error.message));
+}
+function updateNavigationPermissions(){
   const admin=sessionUser?.level==="ADMINISTRATOR";
   const cashierPages=new Set(["dashboard","cashier","transactions","print","products","help"]);
   $$("#topNav [data-page]").forEach(button=>button.classList.toggle("hidden",admin?false:!cashierPages.has(button.dataset.page)));
-  goPage("dashboard");startServerRefresh();if(sessionUser?.level==="ADMINISTRATOR")loadUsers().catch(error=>toast(error.message));
 }
 function logout(){
+  if(!apiToken&&logoutRequest)return;
   pendingRealtimeRefresh=null;
-  fetch(`${API_BASE_URL}/auth/logout`,{method:"POST",credentials:"include"}).catch(()=>{});sessionGeneration++;apiToken="";window.KASIR_REALTIME?.unsubscribe();syncController?.abort();syncController=null;syncInFlight=false;refreshController?.abort();refreshController=null;refreshInFlight=false;state.currentUser=null;sessionUser=null;users=[];normalizeInMemoryState();serverStateVersion=null;serverStateRequestLimit=512*1024;lastSyncedState=null;stateDirty=false;syncFailureCount=0;clearTimeout(serverSyncTimer);clearTimeout(serverRefreshTimer);$("#app").classList.add("hidden"); $("#loginScreen").classList.remove("hidden");
+  sessionGeneration++;apiToken="";syncController?.abort();syncController=null;syncInFlight=false;refreshController?.abort();refreshController=null;refreshInFlight=false;
+  clearTimeout(serverSyncTimer);clearTimeout(serverRefreshTimer);
+  $("#app").classList.add("hidden");$("#loginScreen").classList.remove("hidden");$("#modal")?.classList.remove("open");
+  finishCriticalSave(false);criticalStatus("");
+  state=loadState();cart=[];sessionUser=null;users=[];serverStateVersion=null;serverStateRequestLimit=512*1024;lastSyncedState=null;stateDirty=false;syncFailureCount=0;
+  document.querySelectorAll?.("#app input,#app textarea,#app select,#modalBody input,#modalBody textarea,#modalBody select").forEach(input=>{
+    input.value="";
+    if(input.tagName==="SELECT")input.selectedIndex=-1;
+    if(input.type==="checkbox"||input.type==="radio")input.checked=false;
+    if(input.dataset)delete input.dataset.productId;
+  });
+  if($("#incomingSuggestions")){$("#incomingSuggestions").innerHTML="";$("#incomingSuggestions").hidden=true}
+  $("#modalBody").innerHTML="";$("#modalTitle").textContent="";quickAddTarget="";
+  window.KASIR_REALTIME?.unsubscribe();
+  const signal=requestSignal(new AbortController());
+  $("#retryLogoutBtn")?.classList.add("hidden");
+  logoutRequest=fetch(`${API_BASE_URL}/auth/logout`,{method:"POST",credentials:"include",signal})
+    .then(response=>{if(!response.ok)throw new Error("Logout gagal")})
+    .catch(()=>{$("#retryLogoutBtn")?.classList.remove("hidden");toast("Logout server belum terkonfirmasi. Coba logout kembali sebelum menutup browser.")})
+    .finally(()=>{signal.dispose?.();logoutRequest=null});
 }
 
 function goPage(name){
+  if(criticalSave)return;
   const permissions={settings:"settings",references:"references",suppliers:"suppliers",customers:"customers",incoming:"incoming",stocktake:"stocktake",password:"password"};
   if(permissions[name]&&!requirePermission(permissions[name]))return;
   $$(".page").forEach(x=>x.classList.remove("active"));
@@ -658,12 +771,60 @@ function updateIncomingProduct(){
   $("#incomingCategory").value=p?.category||""; $("#incomingUnit").value=p?.unit||"";
   $("#incomingPrice").value=p?.costPrice||0; updateIncomingTotal();
 }
+function renderIncomingSuggestions(){
+  const query=normalizeProductName($("#incomingProduct").value),list=$("#incomingSuggestions");
+  const matches=state.products.filter(product=>product.active&&normalizeProductName(product.name).includes(query)).slice(0,20);
+  list.hidden=!query;
+  list.innerHTML=matches.length?matches.map(product=>`<button type="button" data-incoming-product="${esc(product.id)}">${esc(product.name)} — Stok ${money(product.stock)}</button>`).join(""):"Produk tidak ditemukan.";
+}
 function updateIncomingTotal(){
   $("#incomingTotal").value=money(Number($("#incomingPrice").value||0)*Number($("#incomingQty").value||0)); updateIncomingSummary();
 }
 function updateIncomingSummary(){
   const product=selectedIncomingProduct(),qty=Number($("#incomingQty").value||0),total=Number($("#incomingPrice").value||0)*qty;
   $("#incomingSummarySupplier").textContent=$("#incomingSupplier").value||"-";$("#incomingSummaryProduct").textContent=product?.name||"-";$("#incomingSummaryQty").textContent=money(qty);$("#incomingSummaryTotal").textContent=rupiah(total);
+}
+function saveIncoming(form){
+  if(criticalSave||!requirePermission("incoming"))return;
+  const p=selectedIncomingProduct(),qty=Number($("#incomingQty").value),price=Number($("#incomingPrice").value);
+  if(!p||!$("#incomingSupplier").value||!Number.isFinite(qty)||!Number.isFinite(price)||qty<=0||price<0)return toast("Data barang masuk belum lengkap atau tidak valid.");
+  return saveStateAndWaitForConfirmation("incoming",id=>{
+    const previousStock=p.stock,previousCostPrice=p.costPrice,resultingCostPrice=calculateWeightedAverageCost(previousStock,previousCostPrice,qty,price);
+    state.incoming.unshift({id:nextId("BM"),saveOperationId:id,date:$("#incomingDate").value,createdAt:new Date().toISOString(),supplier:$("#incomingSupplier").value,product:p.name,productId:p.id,category:p.category,unit:p.unit,purchasePrice:price,qty,total:price*qty,previousStock,previousCostPrice,resultingCostPrice,note:$("#incomingNote").value.trim()});
+    p.stock=previousStock+qty;p.costPrice=resultingCostPrice;
+  },()=>{form.reset();delete $("#incomingProduct").dataset.productId;$("#incomingDate").value=today();updateIncomingProduct();renderAll();toast("Barang masuk dikonfirmasi server.")});
+}
+function applyQuantityEdit(transaction,quantities,id){
+  if(!hasPermission("transactions-edit"))throw new Error("Akses ini hanya untuk ADMINISTRATOR.");
+  if(quantities.length!==transaction.items.length||quantities.some(qty=>!Number.isFinite(qty)||qty<=0))throw new Error("Qty harus berupa angka lebih dari nol.");
+  const deltas=new Map();
+  transaction.items.forEach((item,index)=>deltas.set(item.productId,(deltas.get(item.productId)||0)+quantities[index]-item.qty));
+  for(const [productId,delta] of deltas){
+    const product=productById(productId);
+    if(!product)throw new Error("Produk sudah dihapus; koreksi stok memerlukan pemeriksaan administrator.");
+    if(product.trackStock&&product.stock-delta<0)throw new Error(`Stok ${product.name} tidak cukup.`);
+  }
+  const before=transaction.items.map(item=>item.qty);
+  transaction.items=transaction.items.map((item,index)=>({...item,qty:quantities[index],amount:calculateItemAmount(item.price,item.discount,quantities[index]),profit:(item.price-item.discount-item.costPrice)*quantities[index]}));
+  transaction.subtotal=transaction.items.reduce((sum,item)=>sum+item.amount,0);
+  transaction.discountAmount=Math.min(transaction.subtotal,transaction.discountMethod==="Persen"?transaction.subtotal*transaction.discountPercent/100:transaction.discountAmount);
+  transaction.discountPercent=transaction.subtotal?transaction.discountAmount/transaction.subtotal*100:0;
+  transaction.taxAmount=(transaction.subtotal-transaction.discountAmount)*transaction.taxPercent/100;
+  transaction.total=transaction.subtotal-transaction.discountAmount+transaction.taxAmount;
+  transaction.quantityEdits=[...(transaction.quantityEdits||[]),{id,at:new Date().toISOString(),by:state.currentUser,before,after:quantities}];
+  Object.assign(transaction,normalizeTransaction(transaction));
+  for(const [productId,delta] of deltas){const product=productById(productId);if(product.trackStock)product.stock-=delta}
+}
+function quantityEditModal(invoice){
+  if(!requirePermission("transactions-edit"))return;
+  const t=state.transactions.find(record=>record.invoice===invoice);if(!t)return;
+  openModal("Edit Quantity",`<form id="quantityEditForm" class="modal-form"><input id="quantityInvoice" type="hidden" value="${esc(invoice)}"><p class="wide">Pembayaran lama tetap dicatat. Selisih akan menjadi sisa bayar atau pengembalian yang perlu ditangani administrator. Diskon nominal lama dipertahankan jika jenis diskon transaksi lama tidak tercatat.</p>${t.items.map((item,index)=>`<label class="wide">${esc(item.name)}<input data-edit-qty="${index}" type="number" min="0.01" step="any" value="${item.qty}" required></label>`).join("")}<button class="button green">Simpan Quantity</button></form>`);
+}
+function saveQuantityEdit(){
+  if(criticalSave||!requirePermission("transactions-edit"))return;
+  const t=state.transactions.find(record=>record.invoice===$("#quantityInvoice").value);if(!t)return;
+  const quantities=$$("[data-edit-qty]").map(input=>Number(input.value));
+  return saveStateAndWaitForConfirmation("quantity",id=>applyQuantityEdit(t,quantities,id),()=>{closeModal();renderAll();toast("Perubahan quantity dikonfirmasi server.")});
 }
 
 function renderCashier(){
@@ -679,8 +840,7 @@ function renderCashier(){
   $("#cashProductOptions").innerHTML=activeProducts.map(product=>`<option value="${esc(product.name)}" label="Stok ${money(product.stock)}"></option>`).join("");
   $("#quickAddProductBtn").classList.toggle("hidden",!hasPermission("products-manage"));
   if(!$("#cashInvoice").value) $("#cashInvoice").value=nextInvoice();
-  $("#cashDateTime").value=nowLocal();
-  updateCashProduct();
+  if(!$("#cashDateTime").value)$("#cashDateTime").value=nowLocal();
   renderCart();
 }
 function selectedCashProduct(){
@@ -741,9 +901,10 @@ function clearCashier(){
   cart=[]; $("#cashDiscount").value=0; $("#cashPayment").value=0; $("#cashCourier").value="";
   $("#cashCustomer").value="UMUM";
   $("#cashPaymentMethod").value=""; clearCashItemEntry();
-  $("#cashInvoice").value=nextInvoice(); renderCart();
+  $("#cashInvoice").value=nextInvoice();$("#cashDateTime").value=nowLocal(); renderCart();
 }
 function saveTransaction(action="save"){
+  if(criticalSave||!requirePermission("cashier"))return;
   if(!cart.length)return toast("Belum ada item transaksi.");
   if(!$("#cashPaymentMethod").value)return toast("Pilih metode bayar terlebih dahulu.");
   const t=cartTotals(), paymentMethod=$("#cashPaymentMethod").value;
@@ -752,21 +913,28 @@ function saveTransaction(action="save"){
   if(paymentMethod==="DP"&&t.downPayment<=0)return toast("Jumlah DP harus lebih dari Rp0.");
   for(const item of cart){
     const p=productById(item.productId);
-    if(p?.trackStock && item.qty>p.stock)return toast(`Stok ${p.name} tidak cukup.`);
+    if(!p||!Number.isFinite(item.qty)||item.qty<=0)return toast("Produk/qty tidak valid.");
+    if(p.trackStock && cart.filter(line=>line.productId===p.id).reduce((sum,line)=>sum+line.qty,0)>p.stock)return toast(`Stok ${p.name} tidak cukup.`);
   }
-  cart.forEach(item=>{const p=productById(item.productId); if(p?.trackStock)p.stock-=item.qty});
+  if(state.transactions.some(record=>record.invoice===$("#cashInvoice").value))$("#cashInvoice").value=nextInvoice();
   const tx={
-    id:$("#cashInvoice").value,invoice:$("#cashInvoice").value,createdAt:new Date().toISOString(),
+    id:nextId("TX"),invoice:$("#cashInvoice").value,createdAt:new Date().toISOString(),
     cashier:state.currentUser||state.settings.defaultCashier,courier:$("#cashCourier").value.trim(),
     customer:$("#cashCustomer").value.trim()||"UMUM",paymentMethod:$("#cashPaymentMethod").value,items:clone(cart),
-    subtotal:t.subtotal,discountPercent:t.discountPercent,discountAmount:t.discountAmount,taxPercent:t.taxPercent,
+    discountMethod:state.settings.discountMethod,subtotal:t.subtotal,discountPercent:t.discountPercent,discountAmount:t.discountAmount,taxPercent:t.taxPercent,
     taxAmount:t.taxAmount,total:t.total,payment:t.payment,change:t.change,downPayment:t.downPayment,remaining:t.remaining,cashIn:t.cashIn,paymentStatus:t.paymentStatus
   };
-  state.transactions.unshift(tx); saveState(); selectedPrintInvoice=tx.invoice; clearCashier(); renderAll();
+  if(state.transactions.some(record=>record.invoice===tx.invoice))return toast("Nomor transaksi sudah digunakan. Ubah nomor sebelum menyimpan.");
+  return saveStateAndWaitForConfirmation("cashier",id=>{
+    tx.saveOperationId=id;
+    cart.forEach(item=>{const p=productById(item.productId);if(p.trackStock)p.stock-=item.qty});
+    state.transactions.unshift(tx);
+  },()=>{
+  selectedPrintInvoice=tx.invoice; clearCashier(); renderAll();
   toast(action==="pdf"?"Transaksi disimpan. Pilih ‘Simpan sebagai PDF’ pada dialog cetak.":"Transaksi berhasil disimpan.");
   goPage("print");
   if(action==="print"||action==="pdf")printDocument("receipt",tx);
-  return tx;
+  });
 }
 
 function renderTransactions(){
@@ -778,7 +946,7 @@ function renderTransactions(){
   const start=(transactionPage-1)*pageSize,pagedRows=rows.slice(start,start+pageSize);
   $("#transactionRecordCount").innerHTML=`Total Record: <b>${rows.length}</b>`;
   $("#transactionPageInfo").textContent=rows.length?`Menampilkan ${start+1} sampai ${Math.min(start+pageSize,rows.length)} dari ${rows.length} data`:`Tidak ada data transaksi`;
-  $("#transactionTableBody").innerHTML=pagedRows.length?pagedRows.map(t=>`<tr class="${Number(t.remaining||0)>0?"unpaid-row":""}"><td class="transaction-number">${esc(t.invoice)}</td><td>${formatDateTime(t.createdAt)}</td><td>${esc(t.cashier)}</td><td>${esc(t.courier||"-")}</td><td>${esc(t.customer)}</td><td>${esc(t.paymentMethod)}</td><td>${money(t.items.reduce((s,i)=>s+i.qty,0))}</td><td>${money(t.subtotal)}</td><td>${money(t.discountPercent)}%</td><td>${money(t.discountAmount)}</td><td>${money(t.taxPercent)}%</td><td>${money(t.taxAmount)}</td><td>${money(t.total)}</td><td>${money(getTransactionPaidTotal(t))}</td><td>${money(t.change)}</td><td>${money(t.downPayment)}</td><td>${money(t.remaining)}</td><td><span class="reference-status ${t.paymentStatus==="LUNAS"?"active":"inactive"}">${esc(t.paymentStatus)}</span></td><td><div class="row-actions">${Number(t.remaining||0)>0?`<button class="mini-btn settle" data-tx-settle="${esc(t.invoice)}">Bayar Sisa</button>`:""}<button class="mini-btn view" data-tx-view="${t.invoice}">Detail</button><button class="mini-btn print" data-tx-print="${t.invoice}">Cetak</button>${hasPermission("transactions-delete")?`<button class="mini-btn delete" data-tx-delete="${t.invoice}">Hapus</button>`:""}</div></td></tr>`).join(""):`<tr><td colspan="19" class="empty-table">Transaksi tidak ditemukan.</td></tr>`;
+  $("#transactionTableBody").innerHTML=pagedRows.length?pagedRows.map(t=>`<tr class="${Number(t.remaining||0)>0?"unpaid-row":""}"><td class="transaction-number">${esc(t.invoice)}${canSettleTransaction(t)?`<br><button class="mini-btn settle" data-tx-settle="${esc(t.invoice)}">${settlementLabel(t)}</button>`:""}</td><td>${formatDateTime(t.createdAt)}</td><td>${esc(t.cashier)}</td><td>${esc(t.courier||"-")}</td><td>${esc(t.customer)}</td><td>${esc(t.paymentMethod)}</td><td>${money(t.items.reduce((s,i)=>s+i.qty,0))}</td><td>${money(t.subtotal)}</td><td>${money(t.discountPercent)}%</td><td>${money(t.discountAmount)}</td><td>${money(t.taxPercent)}%</td><td>${money(t.taxAmount)}</td><td>${money(t.total)}</td><td>${money(getTransactionPaidTotal(t))}</td><td>${money(t.change)}</td><td>${money(t.downPayment)}</td><td>${money(t.remaining)}</td><td><span class="reference-status ${t.paymentStatus==="LUNAS"?"active":"inactive"}">${esc(t.paymentStatus)}</span></td><td><div class="row-actions">${canSettleTransaction(t)?`<button class="mini-btn settle" data-tx-settle="${esc(t.invoice)}">${settlementLabel(t)}</button>`:""}<button class="mini-btn view" data-tx-view="${t.invoice}">Detail</button><button class="mini-btn print" data-tx-print="${t.invoice}">Cetak</button>${hasPermission("transactions-edit")?`<button class="mini-btn" data-tx-edit="${esc(t.invoice)}">Edit Qty</button>`:""}${hasPermission("transactions-delete")?`<button class="mini-btn delete" data-tx-delete="${t.invoice}">Hapus</button>`:""}</div></td></tr>`).join(""):`<tr><td colspan="19" class="empty-table">Transaksi tidak ditemukan.</td></tr>`;
   const visible=[];for(let p=1;p<=pageCount;p++){if(p===1||p===pageCount||Math.abs(p-transactionPage)<=1)visible.push(p)}
   let last=0;const buttons=[];for(const p of visible){if(p-last>1)buttons.push(`<span>…</span>`);buttons.push(`<button class="${p===transactionPage?"active":""}" data-tx-page="${p}">${p}</button>`);last=p}
   $("#transactionPagination").innerHTML=`<button data-tx-page="${transactionPage-1}" ${transactionPage===1?"disabled":""}>‹</button>${buttons.join("")}<button data-tx-page="${transactionPage+1}" ${transactionPage===pageCount?"disabled":""}>›</button>`;
@@ -786,22 +954,23 @@ function renderTransactions(){
 function transactionDetail(t){
   if(!t)return toast("Transaksi tidak ditemukan.");
   const isAdmin=hasPermission("transactions-delete");
-  const paidTotal=getTransactionPaidTotal(t),payments=(t.paymentHistory||[]);
+  const payments=(t.paymentHistory||[]);
   openModal("DETAIL TRANSAKSI KELUAR",`
     <div class="modal-detail-grid">
       <div><p>No. Transaksi: <b>${esc(t.invoice)}</b></p><p>Tgl. Transaksi: ${formatDateTime(t.createdAt)}</p><p>Kasir: ${esc(t.cashier)}</p><p>Pengantar: ${esc(t.courier||"-")}</p><p>Pelanggan: ${esc(t.customer)}</p><p>Metode Bayar: ${esc(t.paymentMethod)}</p><p>Status: <b>${esc(t.paymentStatus)}</b></p></div>
-      <div><p>Subtotal: <b>${rupiah(t.subtotal)}</b></p><p>Diskon: ${money(t.discountPercent)}% / ${rupiah(t.discountAmount)}</p><p>Pajak: ${money(t.taxPercent)}% / ${rupiah(t.taxAmount)}</p><p>Total: <b>${rupiah(t.total)}</b></p><p>Total Dibayar: ${rupiah(paidTotal)}</p><p>Kembali: ${rupiah(t.change)}</p><p>DP: ${rupiah(t.downPayment)}</p><p>Sisa: ${rupiah(t.remaining)}</p>${Number(t.remaining||0)>0?`<button class="button blue" data-tx-settle="${esc(t.invoice)}" type="button">Bayar Sisa</button>`:""}</div>
+      <div><p>Subtotal: <b>${rupiah(t.subtotal)}</b></p><p>Diskon: ${money(t.discountPercent)}% / ${rupiah(t.discountAmount)}</p><p>Pajak: ${money(t.taxPercent)}% / ${rupiah(t.taxAmount)}</p><p>Total: <b>${rupiah(t.total)}</b></p>${a4PaymentHtml(t)}${canSettleTransaction(t)?`<button class="button blue" data-tx-settle="${esc(t.invoice)}" type="button">${settlementLabel(t)}</button>`:""}</div>
     </div>
     ${payments.length?`<h4>Riwayat Pelunasan</h4><table class="excel-table"><thead><tr><th>Tanggal</th><th>Metode</th><th>Nominal</th><th>Kasir</th></tr></thead><tbody>${payments.map(payment=>`<tr><td>${esc(payment.date)}</td><td>${esc(payment.method)}</td><td>${money(payment.amount)}</td><td>${esc(payment.cashier||"-")}</td></tr>`).join("")}</tbody></table>`:""}
     <table class="excel-table"><thead><tr><th>Nama Barang</th>${isAdmin?"<th>Harga Modal</th><th>Profit</th>":""}<th>Tipe Harga</th><th>Harga</th><th>Diskon</th><th>Qty</th><th>Satuan</th><th>Jumlah</th></tr></thead><tbody>
     ${t.items.map(i=>`<tr><td>${esc(i.name)}</td>${isAdmin?`<td>${money(i.costPrice)}</td><td>${money(i.profit)}</td>`:""}<td>${esc(i.priceType)}</td><td>${money(calculateItemNetPrice(i.price,i.discount))}</td><td>${money(i.discount)}</td><td>${money(i.qty)}</td><td>${esc(i.unit)}</td><td>${money(i.amount)}</td></tr>`).join("")}</tbody></table>`);
 }
 function settlementModal(invoice){
+  if(!requirePermission("transactions-settle"))return;
   const t=state.transactions.find(transaction=>transaction.invoice===invoice);
   if(!t)return toast("Transaksi tidak ditemukan.");
-  if(Number(t.remaining||0)<=0)return toast("Transaksi ini sudah lunas.");
+  if(!canSettleTransaction(t))return toast("Transaksi ini sudah lunas.");
   const methods=state.paymentMethods.filter(method=>method!=="DP");
-  openModal("Bayar Sisa DP",`
+  openModal(settlementLabel(t),`
     <form id="settlementForm" class="modal-form">
       <input id="settlementInvoice" type="hidden" value="${esc(t.invoice)}">
       <label>No. Transaksi<input value="${esc(t.invoice)}" readonly></label>
@@ -817,16 +986,18 @@ function settlementModal(invoice){
 }
 function saveSettlement(e){
   e.preventDefault();
+  if(criticalSave||!requirePermission("transactions-settle"))return;
   const invoice=$("#settlementInvoice").value,t=state.transactions.find(transaction=>transaction.invoice===invoice);
   if(!t)return toast("Transaksi tidak ditemukan.");
   const remaining=Number(t.remaining||0),amount=Math.max(0,Number($("#settlementAmount").value||0)),method=$("#settlementMethod").value,date=$("#settlementDate").value;
-  if(!amount||amount>remaining)return toast("Nominal pelunasan tidak valid.");
+  if(!Number.isFinite(amount)||!amount||amount>remaining)return toast("Nominal pelunasan tidak valid.");
   if(!method||!date)return toast("Metode dan tanggal pembayaran wajib diisi.");
   if(!confirm(`Simpan pembayaran ${rupiah(amount)} untuk transaksi ${invoice}?`))return;
-  t.paymentHistory=Array.isArray(t.paymentHistory)?t.paymentHistory:[];
-  t.paymentHistory.push({id:`${invoice}-PAY-${Date.now()}`,date,method,amount,createdAt:new Date().toISOString(),cashier:state.currentUser||state.settings.defaultCashier,note:$("#settlementNote").value.trim()});
-  Object.assign(t,normalizeTransaction(t));
-  saveState();closeModal();renderAll();toast(t.paymentStatus==="LUNAS"?"Pembayaran disimpan. Transaksi sudah lunas.":"Pembayaran disimpan.");
+  return saveStateAndWaitForConfirmation("settlement",id=>{
+    t.paymentHistory=Array.isArray(t.paymentHistory)?t.paymentHistory:[];
+    t.paymentHistory.push({id,date,method,amount,createdAt:new Date().toISOString(),cashier:state.currentUser||state.settings.defaultCashier,note:$("#settlementNote").value.trim()});
+    Object.assign(t,normalizeTransaction(t));
+  },()=>{closeModal();renderAll();toast("Pembayaran dikonfirmasi server.")});
 }
 function deleteTransaction(invoice){
   if(!requirePermission("transactions-delete"))return;
@@ -867,15 +1038,25 @@ function receiptDateParts(value){
   try{const date=new Date(value);return {date:new Intl.DateTimeFormat("id-ID",{day:"2-digit",month:"2-digit",year:"2-digit"}).format(date),time:new Intl.DateTimeFormat("id-ID",{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}).format(date)}}
   catch{return {date:String(value||"-"),time:"-"}}
 }
+// Shared display rows keep transaction detail, receipt and A4 payment information aligned.
+function paymentDisplayRows(transaction){
+  const rows=[];
+  if(transaction.paymentMethod==="DP"){
+    rows.push(["DP",rupiah(transaction.downPayment)],["Total Dibayar",rupiah(getTransactionPaidTotal(transaction))]);
+  }else if(transaction.paymentMethod==="Tunai"){
+    rows.push(["Tunai",rupiah(transaction.payment)],["Kembalian",rupiah(transaction.change)]);
+  }else rows.push([transaction.paymentMethod||"-",rupiah(transaction.cashIn)]);
+  if(transaction.quantityEdits?.length||transaction.paymentHistory?.length||transaction.refundDue>0)rows.push(["Total diterima",rupiah(getTransactionReceived(transaction))]);
+  if(transaction.remaining>0)rows.push(["Sisa Pembayaran",rupiah(transaction.remaining)]);
+  if(transaction.refundDue>0)rows.push(["Pengembalian belum dicatat",rupiah(transaction.refundDue)]);
+  rows.push(["Status",getPaymentStatus(transaction)]);
+  return rows;
+}
 function receiptPaymentHtml(transaction){
-  if(transaction.paymentMethod==="Tunai")return `<div class="receipt-row"><span class="label">Tunai</span><span class="value">${rupiah(transaction.payment)}</span></div><div class="receipt-row"><span class="label">Kembalian</span><span class="value">${rupiah(transaction.change)}</span></div>`;
-  if(transaction.paymentMethod==="DP")return `<div class="receipt-row"><span class="label">DP</span><span class="value">${rupiah(transaction.downPayment)}</span></div><div class="receipt-row"><span class="label">Total Dibayar</span><span class="value">${rupiah(getTransactionPaidTotal(transaction))}</span></div><div class="receipt-row"><span class="label">Sisa Pembayaran</span><span class="value">${rupiah(transaction.remaining)}</span></div><div class="receipt-row"><span class="label">Status</span><span class="value">${esc(transaction.paymentStatus)}</span></div>`;
-  return `<div class="receipt-row"><span class="label">${esc(transaction.paymentMethod)}</span><span class="value">${rupiah(transaction.cashIn)}</span></div>`;
+  return paymentDisplayRows(transaction).map(([label,value])=>`<div class="receipt-row"><span class="label">${esc(label)}</span><span class="value">${esc(value)}</span></div>`).join("");
 }
 function a4PaymentHtml(transaction){
-  if(transaction.paymentMethod==="Tunai")return `<p>Tunai: <b>${rupiah(transaction.payment)}</b></p><p>Kembalian: <b>${rupiah(transaction.change)}</b></p>`;
-  if(transaction.paymentMethod==="DP")return `<p>DP: <b>${rupiah(transaction.downPayment)}</b></p><p>Total Dibayar: <b>${rupiah(getTransactionPaidTotal(transaction))}</b></p><p>Sisa Pembayaran: <b>${rupiah(transaction.remaining)}</b></p><p>Status: <b>${esc(transaction.paymentStatus)}</b></p>`;
-  return `<p>${esc(transaction.paymentMethod)}: <b>${rupiah(transaction.cashIn)}</b></p>`;
+  return paymentDisplayRows(transaction).map(([label,value])=>`<p>${esc(label)}: <b>${esc(value)}</b></p>`).join("");
 }
 function renderReceiptHtml(transaction){
   const parts=receiptDateParts(transaction.createdAt);
@@ -883,7 +1064,7 @@ function renderReceiptHtml(transaction){
   return `<div class="receipt-content"><header class="receipt-header"><div class="store-name">SUMBER BERKAH<br>SIDOGURO</div><div class="store-address">ROWO JOMBOR / TRUCUK, KLATEN</div><div class="store-phone">081327375989 / 085727435699</div></header><div class="receipt-divider"></div><section class="receipt-meta"><div class="receipt-row"><span class="label">Tanggal</span><span class="value">${esc(parts.date)}</span></div><div class="receipt-row"><span class="label">Jam</span><span class="value">${esc(parts.time)}</span></div><div class="receipt-row"><span class="label">No. Nota</span><span class="value">${esc(transaction.invoice)}</span></div><div class="receipt-row"><span class="label">Kasir</span><span class="value">${esc(transaction.cashier)}</span></div><div class="receipt-row"><span class="label">Pengantar</span><span class="value">${esc(transaction.courier||"-")}</span></div><div class="receipt-row customer-row"><span class="label">Pelanggan</span><span class="value">${esc(transaction.customer||"UMUM")}</span></div></section><div class="receipt-divider"></div><section class="receipt-items">${items}</section><div class="receipt-divider"></div><section class="receipt-summary"><div class="receipt-row"><span class="label">Subtotal</span><span class="value">${rupiah(transaction.subtotal)}</span></div><div class="receipt-row"><span class="label">Diskon</span><span class="value">${rupiah(transaction.discountAmount)}</span></div><div class="receipt-row"><span class="label">Pajak</span><span class="value">${rupiah(transaction.taxAmount)}</span></div><div class="receipt-row total-row"><span class="label">Total</span><span class="value">${rupiah(transaction.total)}</span></div>${receiptPaymentHtml(transaction)}</section><footer class="receipt-footer"><div>Terimakasih atas pembelian Anda</div><div class="footer-message">simpan nota ini sebagai bukti transaksi</div><div>TF MANDIRI : 1380023004349 Farisa</div></footer></div>`;
 }
 
-function receiptCss(root){return `${root}{box-sizing:border-box;width:54mm;max-width:54mm;margin:0 auto;padding:1.5mm .5mm 2mm;background:#fff;color:#000;overflow:visible;font-family:Arial,Helvetica,sans-serif;font-size:12px;font-weight:400;line-height:1.12}${root} *{box-sizing:border-box;max-width:100%}${root} p,${root} h1,${root} h2{margin:0}${root} .receipt-content{width:100%;max-width:100%;margin:0;padding:0}${root} .receipt-header{text-align:center}${root} .store-name{text-align:center;font-size:17px;font-weight:700;line-height:1.05;letter-spacing:.1px}${root} .store-address,${root} .store-phone{text-align:center;font-size:11px;font-weight:400;line-height:1.12;white-space:nowrap}${root} .store-address{margin-top:.7mm}${root} .store-phone{margin-top:.35mm}${root} .receipt-divider{margin:1mm 0;border-top:1px dashed #000}${root} .receipt-row{display:grid;grid-template-columns:20mm minmax(0,1fr);column-gap:1mm;align-items:start;margin:0;line-height:1.12}${root} .receipt-row .label,${root} .receipt-row .value{min-width:0;font-weight:400}${root} .receipt-row .value{text-align:right;overflow-wrap:break-word;word-break:normal;white-space:normal}${root} .customer-row{margin:1mm 0}${root} .customer-row .label,${root} .customer-row .value{font-weight:600}${root} .customer-row .value{overflow-wrap:break-word;word-break:normal;white-space:normal}${root} .receipt-item{margin:1mm 0;font-size:12px;break-inside:avoid;page-break-inside:avoid}${root} .item-name{margin:0;font-size:12.5px;font-weight:600;line-height:1.12;overflow-wrap:anywhere}${root} .item-detail{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:1mm;margin-top:.15mm;font-size:12px;font-weight:400;line-height:1.12}${root} .item-detail span{min-width:0;overflow-wrap:anywhere}${root} .item-detail span:last-child{text-align:right;white-space:nowrap}${root} .receipt-summary{font-size:12px;font-weight:400;line-height:1.13;break-inside:avoid;page-break-inside:avoid}${root} .total-row{margin:.8mm 0;padding:1mm 0;border-top:1px dashed #000;border-bottom:1px dashed #000;font-size:14px;line-height:1.1}${root} .total-row .label,${root} .total-row .value{font-weight:700}${root} .receipt-footer{margin-top:1.5mm;text-align:center;font-size:11px;font-weight:400;line-height:1.16;overflow-wrap:anywhere;break-inside:avoid;page-break-inside:avoid}${root} .receipt-footer>div{margin-top:1mm}${root} .receipt-footer>div:first-child{margin-top:0}${root} .footer-message{white-space:nowrap}`}
+function receiptCss(root){return `${root}{box-sizing:border-box;width:54mm;max-width:54mm;margin:0 auto;padding:1.5mm .5mm 2mm;background:#fff;color:#000;overflow:visible;font-family:Arial,Helvetica,sans-serif;font-size:9pt;font-weight:400;line-height:1.12}${root} *{box-sizing:border-box;max-width:100%}${root} p,${root} h1,${root} h2{margin:0}${root} .receipt-content{width:100%;max-width:100%;margin:0;padding:0}${root} .receipt-header{text-align:center}${root} .store-name{text-align:center;font-size:12.75pt;font-weight:700;line-height:1.05;letter-spacing:.1px}${root} .store-address,${root} .store-phone{text-align:center;font-size:8.25pt;font-weight:400;line-height:1.12;white-space:normal;overflow-wrap:anywhere}${root} .store-address{margin-top:.7mm}${root} .store-phone{margin-top:.35mm}${root} .receipt-divider{margin:1mm 0;border-top:1px dashed #000}${root} .receipt-row{display:grid;grid-template-columns:20mm minmax(0,1fr);column-gap:1mm;align-items:start;margin:0;line-height:1.12}${root} .receipt-row .label,${root} .receipt-row .value{min-width:0;font-weight:400}${root} .receipt-row .value{text-align:right;overflow-wrap:break-word;word-break:normal;white-space:normal}${root} .customer-row{margin:1mm 0}${root} .customer-row .label,${root} .customer-row .value{font-weight:600}${root} .customer-row .value{overflow-wrap:break-word;word-break:normal;white-space:normal}${root} .receipt-item{margin:1mm 0;font-size:9pt;break-inside:avoid;page-break-inside:avoid}${root} .item-name{margin:0;font-size:9.375pt;font-weight:600;line-height:1.12;overflow-wrap:anywhere}${root} .item-detail{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:1mm;margin-top:.15mm;font-size:9pt;font-weight:400;line-height:1.12}${root} .item-detail span{min-width:0;overflow-wrap:anywhere}${root} .item-detail span:last-child{text-align:right;white-space:normal;overflow-wrap:anywhere}${root} .receipt-summary{font-size:9pt;font-weight:400;line-height:1.13;break-inside:avoid;page-break-inside:avoid}${root} .total-row{margin:.8mm 0;padding:1mm 0;border-top:1px dashed #000;border-bottom:1px dashed #000;font-size:10.5pt;line-height:1.1}${root} .total-row .label,${root} .total-row .value{font-weight:700}${root} .receipt-footer{margin-top:1.5mm;text-align:center;font-size:8.25pt;font-weight:400;line-height:1.16;overflow-wrap:anywhere;break-inside:avoid;page-break-inside:avoid}${root} .receipt-footer>div{margin-top:1mm}${root} .receipt-footer>div:first-child{margin-top:0}${root} .footer-message{white-space:normal;overflow-wrap:anywhere}`}
 function buildA4Rows(transaction,withUnit=false){return transaction.items.map(item=>`<tr><td>${esc(item.name)}</td><td class="number">${money(item.qty)}</td>${withUnit?`<td>${esc(item.unit)}</td>`:""}<td class="number">${rupiah(calculateItemNetPrice(item.price,item.discount))}</td><td class="number">${rupiah(item.amount)}</td></tr>`).join("")}
 function buildInvoiceContent(transaction,settings){
   return `<header class="document-header"><div><h2>${esc(settings.storeName)}</h2><p>${esc(settings.address)}</p><p>WA/HP: ${esc(settings.phone)}</p><p>Email: ${esc(settings.email)}</p></div><div><h1>INVOICE</h1><p>No. Invoice: <b>${esc(transaction.invoice)}</b></p><p>Tanggal: ${formatDateTime(transaction.createdAt)}</p><p>Pembayaran: ${esc(transaction.paymentMethod)}</p></div></header><section class="customer-section"><p>Kepada Yth.</p><b>${esc(transaction.customer||"UMUM")}</b></section><div class="invoice-total">JUMLAH YANG HARUS DIBAYAR<br><strong>${rupiah(transaction.total)}</strong></div><table><thead><tr><th>Nama Produk</th><th>Qty</th><th>Harga</th><th>Jumlah</th></tr></thead><tbody>${buildA4Rows(transaction)}</tbody></table><section class="summary-section"><p>Subtotal: <b>${rupiah(transaction.subtotal)}</b></p><p>Diskon: <b>${rupiah(transaction.discountAmount)}</b></p><p>Pajak: <b>${rupiah(transaction.taxAmount)}</b></p><p>Total: <b>${rupiah(transaction.total)}</b></p>${a4PaymentHtml(transaction)}</section><footer class="document-note"><b>Keterangan:</b><p>${esc(settings.invoiceFooter1)}</p><p>${esc(settings.invoiceFooter2)}</p><p>${esc(settings.invoiceFooter3)}</p></footer>`;
@@ -897,10 +1078,10 @@ function renderPrint(){
   $("#printReceiptType").value=settings.receiptType;$("#printMethod").value=settings.printMethod;
   if(!transaction){$("#printPreviews").innerHTML="<p>Belum ada transaksi.</p>";return}
   selectedPrintInvoice=transaction.invoice;$("#printInvoiceSearch").value=transaction.invoice;
-  $("#printPreviews").innerHTML=`<style>${receiptCss(".print-sheet.receipt")}</style><section class="print-preview-card receipt-preview"><header><b>Preview Struk 58 mm</b><button class="button blue preview-print-button" data-print-document="receipt" type="button">Cetak Struk 58 mm</button></header><div class="preview-canvas"><article class="print-sheet receipt">${renderReceiptHtml(transaction)}</article></div></section><section class="print-preview-card"><header><b>Preview Invoice A4</b><button class="button blue preview-print-button" data-print-document="invoice" type="button">Cetak Invoice A4</button></header><div class="preview-canvas"><article class="print-sheet a4-preview">${buildInvoiceContent(transaction,settings)}</article></div></section><section class="print-preview-card"><header><b>Preview Faktur A4</b><button class="button blue preview-print-button" data-print-document="faktur" type="button">Cetak Faktur A4</button></header><div class="preview-canvas"><article class="print-sheet a4-preview">${buildFakturContent(transaction,settings)}</article></div></section>`;
+  $("#printPreviews").innerHTML=[['receipt','Struk 58 mm'],['invoice','Invoice A4'],['faktur','Faktur A4']].map(([type,label])=>`<section class="print-preview-card ${type==='receipt'?'receipt-preview':''}"><header><b>Preview ${label}</b><button class="button blue preview-print-button" data-print-document="${type}" type="button">Cetak ${label}</button></header><div class="preview-canvas"><iframe title="Preview ${label}" class="document-preview ${type==='receipt'?'receipt-frame':'a4-frame'}" srcdoc="${esc(printFrameHtml(type,transaction))}"></iframe></div></section>`).join("");
 }
 function receiptPrintCss(){return `@page{size:58mm auto;margin:0}*{box-sizing:border-box;max-width:100%}html,body{width:58mm;margin:0;padding:0;background:#fff;color:#000;-webkit-print-color-adjust:exact;print-color-adjust:exact}body.print-receipt{width:58mm}${receiptCss(".receipt-paper")}@media print{html,body{width:58mm;margin:0;padding:0;background:#fff}.receipt-paper{width:54mm;max-width:54mm;margin:0 auto;padding:1.5mm .5mm 2mm;box-shadow:none;border:0}}`}
-function a4PrintCss(){return `@page{size:A4 portrait;margin:12mm}*{box-sizing:border-box}html,body{margin:0;padding:0;background:#fff;color:#000;font-family:Arial,sans-serif;font-size:10pt}body.print-a4{background:#fff}.a4-document{width:100%;max-width:186mm;margin:0 auto}.document-header{display:flex;justify-content:space-between;gap:12mm;border-bottom:1px solid #333;padding-bottom:5mm}.document-header>div{max-width:50%}.document-header h1,.document-header h2{margin:0 0 3mm}.document-header p,.customer-section p,.document-note p{margin:1mm 0}.customer-section{margin:5mm 0}.invoice-total{margin:5mm 0;padding:4mm;border:1px solid #333;text-align:center;font-size:12pt}.invoice-total strong{font-size:16pt}table{width:100%;border-collapse:collapse;table-layout:fixed}thead{display:table-header-group}th,td{border:1px solid #555;padding:2.5mm;overflow-wrap:anywhere}th{background:#eee;text-align:left}.number{text-align:right}tr,.summary-section,.signature-section{break-inside:avoid;page-break-inside:avoid}.summary-section{margin:5mm 0 0 auto;width:75mm;text-align:right}.summary-section p{margin:1mm 0}.document-note{margin-top:7mm}.signature-section{display:flex;justify-content:space-between;margin-top:15mm;text-align:center}.signature-block{display:flex;min-width:58mm;flex-direction:column}.signature-space{display:block;height:35mm}`}
+function a4PrintCss(){return `@page{size:A4 portrait;margin:12mm}*{box-sizing:border-box}html,body{margin:0;padding:0;background:#fff;color:#000;font-family:Arial,sans-serif;font-size:10pt}body.print-a4{background:#fff;width:210mm;padding:12mm}@media print{body.print-a4{width:186mm;padding:0}button{display:none}}.a4-document{width:100%;max-width:186mm;margin:0 auto}.document-header{display:flex;justify-content:space-between;gap:12mm;border-bottom:1px solid #333;padding-bottom:5mm}.document-header>div{max-width:50%}.document-header h1,.document-header h2{margin:0 0 3mm}.document-header p,.customer-section p,.document-note p{margin:1mm 0}.customer-section{margin:5mm 0}.invoice-total{margin:5mm 0;padding:4mm;border:1px solid #333;text-align:center;font-size:12pt}.invoice-total strong{font-size:16pt}table{width:100%;border-collapse:collapse;table-layout:fixed}thead{display:table-header-group}th,td{border:1px solid #555;padding:2.5mm;overflow-wrap:anywhere}th{background:#eee;text-align:left}.number{text-align:right}tr,.summary-section,.signature-section{break-inside:avoid;page-break-inside:avoid}.summary-section{margin:5mm 0 0 auto;width:75mm;text-align:right}.summary-section p{margin:1mm 0}.document-note{margin-top:7mm}.signature-section{display:flex;justify-content:space-between;margin-top:15mm;text-align:center}.signature-block{display:flex;min-width:58mm;flex-direction:column}.signature-space{display:block;height:35mm}`}
 function printFrameHtml(type,transaction){
   const receipt=type==="receipt",css=receipt?receiptPrintCss():a4PrintCss(),bodyClass=receipt?"print-receipt":"print-a4",mainClass=receipt?"receipt-paper":"a4-document";
   return `<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(type.toUpperCase())} ${esc(transaction.invoice)}</title><style id="printPageStyle">${css}</style></head><body class="${bodyClass}"><main class="${mainClass}">${printContent(type,transaction,state.settings)}</main></body></html>`;
@@ -956,11 +1137,15 @@ function updateStockDifference(){
 function updateStockSummary(){const p=productById($("#stockProduct").value),system=Number($("#stockSystem").value||0),physical=Number($("#stockPhysical").value||0),difference=physical-system;$("#stockSummaryProduct").textContent=p?.name||"-";$("#stockSummarySystem").textContent=money(system);$("#stockSummaryPhysical").textContent=money(physical);$("#stockSummaryDifference").textContent=money(difference);$("#stockSummaryDifference").className=difference<0?"negative":difference>0?"positive":"";}
 
 function renderAll(){
+  const drafts=$$("#cashierPage input,#cashierPage select,#incomingForm input,#incomingForm select,#incomingForm textarea").map(el=>[el,el.value]);
   renderDashboard(); renderSettings(); renderReferences(); renderProducts(); renderSuppliers(); renderCustomers();
   renderIncoming(); renderCashier(); renderTransactions(); renderPrint(); renderStocktake();
+  drafts.forEach(([el,value])=>{if(el.tagName==="SELECT"&&value&&![...el.options].some(option=>option.value===value))el.add(new Option(value,value));el.value=value});
+  renderCart();updateIncomingSummary();
 }
 
 document.addEventListener("submit",async e=>{
+  if(criticalSave){e.preventDefault();return}
   if(e.target.id==="loginForm"){e.preventDefault();login($("#loginUsername").value,$("#loginPassword").value)}
   if(e.target.id==="settingsForm")saveSettings(e);
   if(e.target.id==="referenceForm"){e.preventDefault();if(!requirePermission("references"))return;const name=$("#referenceName").value.trim(),index=$("#referenceIndex").value;
@@ -977,21 +1162,19 @@ document.addEventListener("submit",async e=>{
     const x={id:id||nextId(type==="supplier"?"S":"C",list),name:$("#contactName").value.trim(),address:$("#contactAddress").value.trim(),phone:$("#contactPhone").value.trim(),email:$("#contactEmail").value.trim(),note:$("#contactNote").value.trim()};
     if(id)list[list.findIndex(a=>a.id===id)]=x;else list.push(x);saveState();closeModal();renderAll();if(quickAdd)$("#cashCustomer").value=x.name;toast("Data disimpan.");
   }
-  if(e.target.id==="incomingForm"){e.preventDefault();if(!requirePermission("incoming"))return;const p=selectedIncomingProduct(),qty=Number($("#incomingQty").value||0),price=Number($("#incomingPrice").value||0);
-    if(!p||!$("#incomingSupplier").value||qty<=0||price<0)return toast("Data barang masuk belum lengkap atau tidak valid.");
-    const previousStock=Math.max(0,toSafeNumber(p.stock)),previousCostPrice=Math.max(0,toSafeNumber(p.costPrice));
-    const resultingCostPrice=calculateWeightedAverageCost(previousStock,previousCostPrice,qty,price);
-    state.incoming.unshift({id:nextId("BM",state.incoming),date:$("#incomingDate").value,createdAt:new Date().toISOString(),supplier:$("#incomingSupplier").value,product:p.name,productId:p.id,category:p.category,unit:p.unit,purchasePrice:price,qty,total:price*qty,previousStock,previousCostPrice,resultingCostPrice,note:$("#incomingNote").value.trim()});
-    p.stock=previousStock+qty;p.costPrice=resultingCostPrice;saveState();e.target.reset();$("#incomingDate").value=today();renderAll();toast(`Barang masuk disimpan. Harga modal baru ${rupiah(resultingCostPrice)} per ${p.unit}.`);
-  }
+  if(e.target.id==="incomingForm"){e.preventDefault();saveIncoming(e.target)}
+  if(e.target.id==="quantityEditForm"){e.preventDefault();saveQuantityEdit()}
   if(e.target.id==="stocktakeForm"){e.preventDefault();if(!requirePermission("stocktake"))return;const p=productById($("#stockProduct").value),physical=Number($("#stockPhysical").value||0);if(!p||physical<0)return toast("Data stok opname tidak valid.");
     const old=p.stock,diff=physical-old;state.stocktakes.unshift({id:nextId("OP",state.stocktakes),date:$("#stockDate").value,product:p.name,productId:p.id,category:p.category,unit:p.unit,systemStock:old,physicalStock:physical,difference:diff,note:$("#stockNote").value.trim()});p.stock=physical;saveState();e.target.reset();$("#stockDate").value=today();renderAll();toast("Stok opname disimpan.");
   }
   if(e.target.id==="settlementForm")saveSettlement(e);
-  if(e.target.id==="passwordForm"){e.preventDefault();if($("#newPassword").value!==$("#confirmPassword").value)return toast("Konfirmasi password tidak sama.");try{await apiRequest("/users/me/password",{method:"PUT",body:JSON.stringify({oldPassword:$("#oldPassword").value,newPassword:$("#newPassword").value})});e.target.reset();logout();toast("Password berhasil diubah. Silakan login kembali.")}catch(error){toast(error.message)}}
+  if(e.target.id==="passwordForm"){e.preventDefault();if(!requirePermission("password"))return;if($("#newPassword").value!==$("#confirmPassword").value)return toast("Konfirmasi password tidak sama.");try{await apiRequest("/users/me/password",{method:"PUT",body:JSON.stringify({oldPassword:$("#oldPassword").value,newPassword:$("#newPassword").value})});e.target.reset();logout();toast("Password berhasil diubah. Silakan login kembali.")}catch(error){toast(error.message)}}
 });
 
 document.addEventListener("click",async e=>{
+  if(e.target.closest("#logoutBtn,#retryLogoutBtn")){logout();return}
+  if(e.target.closest("#retrySaveBtn")){retryCriticalSave();return}
+  if(criticalSave)return;
   const nav=e.target.closest("[data-page]");if(nav)goPage(nav.dataset.page);
   if(e.target.closest("#sidebarToggle")){
     if(matchMedia("(max-width: 768px)").matches){
@@ -1006,7 +1189,6 @@ document.addEventListener("click",async e=>{
   }
   if(e.target.id==="sidebarBackdrop")document.body.classList.remove("mobile-sidebar-open");
   if(nav&&matchMedia("(max-width: 768px)").matches)document.body.classList.remove("mobile-sidebar-open");
-  if(e.target.id==="logoutBtn")logout();
   if(e.target.id==="modalClose")closeModal();
   if(e.target.id==="toggleUserPassword"){
     const input=$("#userPassword"),show=input?.type==="password";
@@ -1053,6 +1235,8 @@ document.addEventListener("click",async e=>{
   const ci=e.target.closest("[data-cart-delete]");if(ci){cart=cart.filter(x=>x.lineId!==ci.dataset.cartDelete);renderCart();}
   const iv=e.target.closest("[data-incoming-delete]");if(iv&&requirePermission("incoming"))deleteIncomingRecord(iv.dataset.incomingDelete);
   const ts=e.target.closest("[data-tx-settle]");if(ts)settlementModal(ts.dataset.txSettle);
+  const edit=e.target.closest("[data-tx-edit]");if(edit)quantityEditModal(edit.dataset.txEdit);
+  const suggestion=e.target.closest("[data-incoming-product]");if(suggestion){const p=productById(suggestion.dataset.incomingProduct);if(p){$("#incomingProduct").value=p.name;$("#incomingProduct").dataset.productId=p.id;updateIncomingProduct();$("#incomingSuggestions").hidden=true}}
   const tv=e.target.closest("[data-tx-view]");if(tv)transactionDetail(state.transactions.find(x=>x.invoice===tv.dataset.txView));
   const tp=e.target.closest("[data-tx-print]");if(tp){selectedPrintInvoice=tp.dataset.txPrint;goPage("print")}
   const td=e.target.closest("[data-tx-delete]");if(td)deleteTransaction(td.dataset.txDelete);
@@ -1072,7 +1256,7 @@ document.addEventListener("keydown",e=>{
 });
 document.addEventListener("input",e=>{
   if(["productSearch","supplierSearch","customerSearch","incomingSearch","incomingDateFilter","stockSearch","stockDateFilter","transactionSearch","transactionDateFilter"].includes(e.target.id)){if(e.target.id.startsWith("transaction"))transactionPage=1;if(e.target.id==="productSearch")productPage=1;if(e.target.id==="customerSearch")customerPage=1;renderAll();}
-  if(e.target.id==="incomingProduct")updateIncomingProduct();
+  if(e.target.id==="incomingProduct"&&!e.isComposing){updateIncomingProduct();renderIncomingSuggestions()}
   if(["incomingPrice","incomingQty"].includes(e.target.id))updateIncomingTotal();
   if(["cashPrice","cashItemDiscount","cashQty"].includes(e.target.id))updateCashLine();
   if(e.target.id==="cashProduct")updateCashProduct();
@@ -1088,8 +1272,9 @@ document.addEventListener("keydown",e=>{
   }
 });
 document.addEventListener("reset",e=>{
-  if(e.target.id==="incomingForm")setTimeout(()=>{delete $("#incomingProduct").dataset.productId;$("#incomingDate").value=today();updateIncomingProduct();},0);
-  if(e.target.id==="stocktakeForm")setTimeout(()=>{$("#stockDate").value=today();updateStockSummary();},0);
+  const generation=sessionGeneration;
+  if(e.target.id==="incomingForm")setTimeout(()=>{if(generation!==sessionGeneration)return;delete $("#incomingProduct").dataset.productId;$("#incomingDate").value=today();updateIncomingProduct();$("#incomingSuggestions").hidden=true;},0);
+  if(e.target.id==="stocktakeForm")setTimeout(()=>{if(generation!==sessionGeneration)return;$("#stockDate").value=today();updateStockSummary();},0);
 });
 document.addEventListener("change",e=>{
   if(e.target.id==="incomingProduct")updateIncomingProduct();
@@ -1115,3 +1300,7 @@ normalizeInMemoryState();
 
 $("#loginScreen").classList.remove("hidden");
 restoreSession();
+
+window.addEventListener("navigation-ready",updateNavigationPermissions);
+window.addEventListener("beforeunload",event=>{if(stateDirty||criticalSave){event.preventDefault();event.returnValue=""}});
+document.addEventListener("compositionend",event=>{if(event.target.id==="incomingProduct"){updateIncomingProduct();renderIncomingSuggestions()}});

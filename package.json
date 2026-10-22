@@ -2,7 +2,7 @@
   "scripts": {
     "build": "node scripts/build.js",
     "check": "node scripts/check.js",
-    "test": "node scripts/http-security-test.js && node scripts/netlify-test.js && node scripts/state-refresh-test.js",
+    "test": "node scripts/http-security-test.js && node scripts/netlify-test.js && node scripts/state-refresh-test.js && node scripts/critical-save-test.js && node scripts/business-api-test.js",
     "start": "npm run build && node server/index.js",
     "dev": "npm run build && node --watch server/index.js"
   },
