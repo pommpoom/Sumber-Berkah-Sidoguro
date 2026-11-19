@@ -5,10 +5,10 @@ const { test } = require('node:test');
 const source = fs.readFileSync(require.resolve('../assets/js/app.js'), 'utf8');
 const seed = fs.readFileSync(require.resolve('../assets/js/seed-data.js'), 'utf8');
 const reply = (body, status=200) => new Response(JSON.stringify(body), {status});
-const deferred = () => { let resolve; const promise=new Promise(done=>{resolve=done});return {promise,resolve}; };
+const deferred = () => { let resolve,reject; const promise=new Promise((done,fail)=>{resolve=done;reject=fail});return {promise,resolve,reject}; };
 const settle = () => new Promise(resolve=>setImmediate(resolve));
 
-function browser() {
+function browser(storage=new Map()) {
   const nodes=new Map(),timers=new Map(),requests=[],replies=[],messages=[];
   let timerId=0;
   const node = id => {
@@ -24,16 +24,17 @@ function browser() {
     location:{hostname:'cashier.test',port:'',protocol:'https:'},
     document:{visibilityState:'visible',querySelector:node,querySelectorAll:()=>[]},
     window:{},navigator:{onLine:true},crypto:require('node:crypto').webcrypto,
-    AbortController,AbortSignal:{timeout:AbortSignal.timeout.bind(AbortSignal),any:AbortSignal.any.bind(AbortSignal)},Blob,Option:class {},
+    localStorage:{get length(){return storage.size},key:i=>[...storage.keys()][i],getItem:k=>storage.get(k)??null,setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)},
+    AbortController,AbortSignal:{timeout:AbortSignal.timeout.bind(AbortSignal),any:AbortSignal.any.bind(AbortSignal)},Blob,URLSearchParams,Option:class {},
     setTimeout(callback,delay){timers.set(++timerId,{callback,delay});return timerId},clearTimeout(id){timers.delete(id)},
     confirm:()=>true,
-    async fetch(url,options){requests.push({url,...options});if(url.endsWith('/auth/logout'))return reply({ok:true});assert.ok(replies.length,`Unexpected request ${url}`);return replies.shift()},
+    async fetch(url,options){if(options?.headers?.['Idempotency-Key']){const persisted=[...storage.values()].flatMap(value=>{try{return [JSON.parse(value)]}catch{return []}}).find(x=>x.id===options.headers['Idempotency-Key']);assert.ok(persisted,'durable record must exist before fetch');assert.equal(persisted.body,options.body);}requests.push({url,...options});if(url.endsWith('/auth/logout'))return reply({ok:true});assert.ok(replies.length,`Unexpected request ${url}`);return replies.shift()},
     recordMessage:message=>messages.push(message)
   });
   const run=code=>vm.runInContext(code,context);
   run(seed+'\n'+source.slice(0,source.indexOf('document.addEventListener("submit"')));
   run(`
-    const realRenderAll=renderAll,realRenderCashier=renderCashier;
+    const realRenderAll=renderAll,realRenderCashier=renderCashier,realPrintDocument=printDocument;
     renderAll=()=>{};goPage=()=>{};printDocument=()=>{};toast=recordMessage;
     sessionUser={id:'admin',username:'ADMIN',level:'ADMINISTRATOR'};apiToken='cookie';sessionGeneration=1;
     state.products=[{id:'p',name:'PRODUCT',active:true,trackStock:true,stock:20,costPrice:4,retailPrice:10,wholesalePrice:10,unit:'Pcs'}];
@@ -42,8 +43,97 @@ function browser() {
   `);
   node('#cashInvoice').value='1';node('#cashPaymentMethod').value='Tunai';node('#cashPayment').value='20';
   node('#incomingProduct').value='PRODUCT';node('#incomingSupplier').value='Supplier';node('#incomingQty').value='3';node('#incomingPrice').value='8';node('#incomingDate').value='2026-10-22';
-  return {run,node,requests,replies,timers,messages,context};
+  return {run,node,requests,replies,timers,messages,context,storage};
 }
+
+const dashboardFixture=()=>({count:959,sales:123456,profit:3456,moneyIn:100000,payments:{Tunai:100000},receivable:23456,unpaidCount:20,recent:[],days:[{label:'17/11',sales:123456,profit:3456}],topProducts:[]});
+function queueRead(b,{version=2,admin=false,transaction,settings,historyTotal=960,incomingTotal=515,stockTotal=8}={}){
+ b.replies.push(reply({state:{products:[],customers:[],suppliers:[],transactions:[],incoming:[],stocktakes:[],...(settings?{settings}:{})},version}),reply({rows:transaction?[transaction]:[],page:1,total:historyTotal,pages:Math.ceil(historyTotal/10)}),reply(dashboardFixture()));
+ if(admin)b.replies.push(reply({rows:[{id:'new-incoming'}],total:incomingTotal,pages:26,summary:{qty:100,total:999}}),reply({rows:[{id:'new-stocktake'}],total:stockTotal,pages:1,summary:{positive:3,negative:-1,difference:2}}));
+}
+
+test('normalized sale sends only this operation, waits for ack and ignores double submit',async()=>{
+  const b=browser(),slow=deferred();b.run('persistenceMode="normalized";sessionUser.level="KASIR"');b.replies.push(slow.promise);
+  b.run('saveTransaction()');b.run('saveTransaction()');assert.equal(b.requests.length,1);
+  const req=b.requests[0],body=JSON.parse(req.body);assert.ok(req.url.endsWith('/transactions'));assert.equal(req.method,'POST');assert.equal(body.items.length,1);assert.equal(body.transactions,undefined);assert.equal(body.state,undefined);assert.ok(Buffer.byteLength(req.body)<1024);assert.equal(b.run('cart.length'),1);
+  queueRead(b);
+  slow.resolve(reply({version:2,transaction:{id:'new',invoice:'N-1',total:20,cashIn:20,paymentMethod:'Tunai',items:body.items},products:[{id:'p',stock:18}]}));await settle();await settle();
+  assert.equal(b.run('cart.length'),0);assert.equal(b.run('criticalSave'),null);assert.equal(b.run('selectedPrintInvoice'),'N-1');assert.ok(b.requests.every(r=>!r.url.endsWith('/state')));
+});
+test('normalized lost acknowledgement retries the exact body and operation ID',async()=>{
+  const b=browser();b.run('persistenceMode="normalized";sessionUser.level="KASIR"');b.replies.push(Promise.reject(new TypeError('lost response')));
+  b.run('saveTransaction()');await settle();assert.equal(b.run('cart.length'),1);assert.ok(b.run('criticalSave'));
+  b.replies.push(reply({version:2,transaction:{id:'same',invoice:'961',total:20,cashIn:20,items:[]},products:[]}));queueRead(b);b.run('retryCriticalSave()');await settle();
+  assert.equal(b.requests[0].body,b.requests[1].body);assert.equal(b.requests[0].headers['Idempotency-Key'],b.requests[1].headers['Idempotency-Key']);assert.equal(b.run('criticalSave'),null);
+});
+test('normalized validation error preserves draft; read-only blocks all commands',async()=>{
+  const b=browser();b.run('persistenceMode="normalized";sessionUser.level="KASIR"');b.replies.push(reply({message:'Insufficient stock'},400));b.run('saveTransaction()');await settle();
+  assert.equal(b.run('cart.length'),1);assert.equal(b.run('criticalSave'),null);assert.match(b.node('#saveStatus span').textContent,/Insufficient stock/);
+  b.run('persistenceMode="normalized-read";saveTransaction()');assert.equal(b.requests.length,1);
+});
+test('normalized history boot uses bounded page APIs without app_state',async()=>{
+  const b=browser();b.run('persistenceMode="normalized";sessionUser.level="KASIR";transactionPage=2');
+  b.replies.push(reply({state:{products:[],customers:[],suppliers:[],transactions:[],incoming:[],stocktakes:[]},version:2}),reply({rows:[{id:'page2'}],page:2,total:959,pages:96}),reply(dashboardFixture()));
+  const data=await b.run('getNormalizedState()');assert.equal(data.state.transactions.length,1);assert.equal(b.requests.length,3);assert.match(b.requests[1].url,/page=2&limit=10&expectedRevision=2/);assert.ok(b.requests.every(r=>!r.url.includes('/state')));
+});
+
+test('KASIR dashboard uses aggregate totals beyond the history page and hides all profit UI',async()=>{
+ const b=browser();b.run('persistenceMode="normalized";sessionUser.level="KASIR"');queueRead(b,{transaction:{id:'one',invoice:'960',total:20,items:[]}});
+ const boot=await b.run('getNormalizedState()');b.context.boot=boot;b.run('state=migrateState(boot.state);applyNormalizedRead(boot);renderDashboard()');
+ assert.equal(b.run('state.transactions.length'),1);assert.match(b.node('#dashboardKpis').innerHTML,/959 transaksi/);assert.match(b.node('#dashboardKpis').innerHTML,/123\.456/);
+ assert.doesNotMatch(b.node('#dashboardKpis').innerHTML,/Laba Kotor/);assert.doesNotMatch(b.node('#dashboardChart').innerHTML,/profit|Laba Kotor/);
+ b.run('sessionUser.level="ADMINISTRATOR";renderDashboard()');assert.match(b.node('#dashboardChart').innerHTML,/profit-bar/);assert.match(b.node('#dashboardKpis').innerHTML,/Laba Kotor/);
+});
+test('Jakarta business-day boundaries do not depend on the device timezone',()=>{
+ const b=browser();for(const [iso,day] of [['2026-11-16T16:59:00Z','2026-11-16'],['2026-11-16T17:00:00Z','2026-11-17'],['2026-11-16T17:30:00Z','2026-11-17'],['2026-11-16T23:59:00Z','2026-11-17'],['2026-11-17T00:00:00Z','2026-11-17']])assert.equal(b.run(`businessDate(${JSON.stringify(iso)})`),day);
+ assert.equal(b.run('transactionBusinessDate({businessDate:"2026-11-17",createdAt:"2026-11-16T17:30:00Z"})'),'2026-11-17');
+});
+test('durable command survives lost acknowledgement and fresh-page login, retaining exact ID/body',async()=>{
+ const storage=new Map(),first=browser(storage),lost=deferred();first.run('persistenceMode="normalized";sessionUser.level="KASIR"');first.replies.push(lost.promise);first.run('saveTransaction()');
+ assert.equal(storage.size,1,'must persist before HTTP completes');const pending=JSON.parse([...storage.values()][0]);assert.deepEqual(Object.keys(pending).sort(),['actor','body','id','method','path','timestamp']);assert.equal(pending.body,first.requests[0].body);assert.equal(pending.id,first.requests[0].headers['Idempotency-Key']);assert.doesNotMatch(JSON.stringify(pending),/cookie|password|jwt|secret/i);
+ lost.reject(new TypeError('ack lost'));await settle();assert.equal(storage.size,1);
+ const fresh=browser(storage);fresh.run('showApp=()=>{}');queueRead(fresh);
+ fresh.replies.push(reply({version:2,transaction:{id:'saved',invoice:'960',total:20,items:[]},products:[]}));queueRead(fresh);
+ await fresh.run('activateSession({id:"admin",username:"ADMIN",level:"KASIR",persistenceMode:"normalized"})');await settle();await settle();
+ const retry=fresh.requests.find(r=>r.method==='POST');assert.equal(retry.body,pending.body);assert.equal(retry.headers['Idempotency-Key'],pending.id);assert.equal(storage.size,0);assert.equal(fresh.run('selectedPrintInvoice'),'960');
+});
+test('different actor cannot replay pending command; explicit logout retains ambiguous operation',async()=>{
+ const storage=new Map(),b=browser(storage);b.run('persistenceMode="normalized";sessionUser.level="KASIR"');b.replies.push(Promise.reject(new TypeError('offline')));b.run('saveTransaction()');await settle();await b.run('logout()');assert.equal(storage.size,1);
+ const other=browser(storage);other.run('persistenceMode="normalized";sessionUser.id="other"');assert.equal(other.run('recoverPendingOperation()'),false);assert.equal(other.requests.length,0);assert.equal(storage.size,1);
+ other.run('sessionUser.id="admin";persistenceMode="normalized-read"');assert.equal(other.run('recoverPendingOperation()'),false);assert.equal(other.requests.length,0);
+});
+test('durable storage failures and credentials block sending; definitive rejection clears pending',async()=>{
+ const b=browser();b.run('persistenceMode="normalized";localStorage.setItem=()=>{throw new Error("quota")};saveTransaction()');assert.equal(b.requests.length,0);assert.equal(b.run('cart.length'),1);
+ const c=browser();c.run('persistenceMode="normalized";normalizedOperation("/transactions","POST",{password:"forbidden"},()=>{})');assert.equal(c.storage.size,0);assert.equal(c.requests.length,0);
+ const d=browser();d.run('persistenceMode="normalized"');d.replies.push(reply({message:'Rejected'},400));d.run('saveTransaction()');await settle();assert.equal(d.storage.size,0);assert.equal(d.run('cart.length'),1);
+});
+test('failed durable cleanup does not cause an automatic retry loop',async()=>{
+ const b=browser();b.run('persistenceMode="normalized";sessionUser.level="KASIR";localStorage.removeItem=()=>{throw new Error("storage unavailable")}');
+ b.replies.push(reply({version:2,transaction:{id:'saved',invoice:'960',total:20,items:[]},products:[]}));queueRead(b);b.run('saveTransaction()');await settle();await settle();
+ assert.equal(b.storage.size,1);assert.equal(b.requests.filter(r=>r.method==='POST').length,1);assert.equal(b.run('criticalSave'),null);
+});
+test('incomplete acknowledgement retains the durable command and draft',async()=>{
+ const b=browser();b.run('persistenceMode="normalized";sessionUser.level="KASIR"');b.replies.push(reply({version:2}));b.run('saveTransaction()');await settle();assert.equal(b.storage.size,1);assert.equal(b.run('cart.length'),1);assert.ok(b.run('criticalSave'));assert.match(b.node('#saveStatus span').textContent,/Konfirmasi server tidak lengkap/);
+});
+test('revision conflict retries the whole bounded read set without publishing mixed metadata',async()=>{
+ const b=browser();b.run('persistenceMode="normalized";sessionUser.level="KASIR"');
+ b.replies.push(reply({state:{},version:2}),reply({message:'Read revision changed'},409),reply({...dashboardFixture(),sales:1}));queueRead(b,{version:3,historyTotal:961});
+ const boot=await b.run('getNormalizedState()');assert.equal(boot.version,3);assert.equal(b.run('normalizedDashboard'),null,'reads do not publish metadata before state acceptance');b.context.boot=boot;b.run('applyNormalizedRead(boot)');assert.equal(b.run('normalizedHistory.total'),961);assert.equal(b.run('normalizedDashboard.sales'),123456);assert.equal(b.requests.length,6);assert.match(b.requests[1].url,/expectedRevision=2/);assert.match(b.requests[4].url,/expectedRevision=3/);
+});
+test('continuous revision conflicts stop after three read attempts',async()=>{
+ const b=browser();b.run('persistenceMode="normalized";sessionUser.level="KASIR"');for(let i=0;i<3;i++)b.replies.push(reply({state:{},version:i+2}),reply({message:'changed'},409),reply(dashboardFixture()));
+ await assert.rejects(b.run('getNormalizedState()'),/changed/);assert.equal(b.requests.length,9);assert.equal(b.run('normalizedDashboard'),null);
+});
+test('normalized transaction refresh button performs server reads',async()=>{
+ const b=browser();b.run('persistenceMode="normalized";sessionUser.level="KASIR"');queueRead(b);b.context.handlers={};b.run('document.addEventListener=(type,fn)=>handlers[type]=fn');
+ const start=source.indexOf('document.addEventListener("click",async e=>{'),end=source.indexOf('document.addEventListener("keydown"',start);b.run(source.slice(start,end));
+ await b.run('handlers.click({target:{id:"refreshTransactionsBtn",closest:()=>null}})');await settle();assert.equal(b.requests.length,3);assert.equal(b.run('normalizedHistory.total'),960);
+});
+for(const [path,method,body] of [['/incoming','POST',{productId:'p'}],['/stocktakes','POST',{productId:'p'}],['/transactions','POST',{}],['/transactions/t/payments','POST',{}],['/transactions/t/items','PATCH',{}]])test(`confirmed ${path} refreshes bounded rows, summaries and pagination`,async()=>{
+ const b=browser();b.run('persistenceMode="normalized"');const transaction={id:'t',invoice:'960',total:100,cashIn:100,items:[]};b.replies.push(reply({version:2,transaction,record:{id:'record'},products:[]}));queueRead(b,{admin:true,transaction});b.node('#incomingNote').value='draft retained';
+ b.run(`normalizedOperation(${JSON.stringify(path)},${JSON.stringify(method)},${JSON.stringify(body)},()=>{})`);await settle();await settle();
+ assert.equal(b.run('normalizedHistory.total'),960);assert.equal(b.run('normalizedIncomingMeta.summary.total'),999);assert.equal(b.run('normalizedStockMeta.total'),8);assert.equal(b.run('state.transactions[0].total'),100);assert.equal(b.node('#incomingNote').value,'draft retained');assert.ok(b.requests.every(r=>!r.url.includes('/state')));assert.ok(b.requests.filter(r=>!r.method).every(r=>r.url.includes('/bootstrap')||r.url.includes('expectedRevision=2')));
+});
 
 for(const kind of ['cashier','incoming']) {
   const start=kind==='cashier'?'saveTransaction()':'saveIncoming($("#incomingForm"))';
@@ -152,7 +242,7 @@ test('search filters normalized input with stable product ID; input listener is 
   let onInput;b.context.document.addEventListener=(_name,fn)=>{onInput=fn};b.run(listener);b.node('#incomingProduct').value='pro';onInput({target:{id:'incomingProduct'}});assert.match(b.node('#incomingSuggestions').innerHTML,/PRODUCT/);
 });
 test('preview and print share isolated layout, physical dimensions and print rules',()=>{
-  const b=browser();transaction(b);b.run('renderPrint()');const markup=b.node('#printPreviews').innerHTML;
+  const b=browser();transaction(b);b.run('selectedPrintInvoice="1";renderPrint()');const markup=b.node('#printPreviews').innerHTML;
   assert.equal((markup.match(/srcdoc=/g)||[]).length,3);assert.match(markup,/58mm/);assert.match(markup,/@media print/);assert.match(markup,/A4 portrait/);
   assert.doesNotMatch(b.run('receiptCss(".receipt")'),/font-size:[\d.]+px|white-space:nowrap/);
 });
@@ -236,4 +326,86 @@ test('logout clears all draft control types, product IDs, suggestions and modal 
   assert.equal(b.node('#incomingSuggestions').innerHTML,'');assert.equal(b.node('#incomingSuggestions').hidden,true);
   assert.equal(b.node('#modalBody').innerHTML,'');assert.equal(b.node('#modalTitle').textContent,'');assert.equal(b.run('quickAddTarget'),'');
   assert.deepEqual(b.requests.map(request=>request.url),['/api/auth/logout'],'logout must not PUT persisted application data');
+});
+
+test('malformed records from another actor do not block own pending recovery',async()=>{
+ const b=browser();b.run('persistenceMode="normalized"');b.replies.push(Promise.reject(new TypeError('offline')));b.run('saveTransaction()');await settle();
+ const own=JSON.parse([...b.storage.values()][0]);b.storage.set('kasir.pending.v1:other:broken','{bad');
+ assert.equal(b.run('pendingOperations("admin").length'),1);
+ const fresh=browser(b.storage);fresh.run('persistenceMode="normalized"');fresh.replies.push(reply({message:'Rejected'},400));assert.equal(fresh.run('recoverPendingOperation()'),true);await settle();
+ assert.equal(fresh.requests[0].headers['Idempotency-Key'],own.id);assert.equal(b.storage.get('kasir.pending.v1:other:broken'),'{bad');assert.equal(b.storage.size,1);
+});
+test('missing legacy selection never falls back to another invoice',async()=>{
+ const b=browser();transaction(b);b.run('selectedPrintInvoice="missing"');assert.equal(b.run('selectedPrintTransaction()'),null);await b.run('realPrintDocument("receipt")');assert.ok(b.messages.some(x=>/diblokir/.test(x)));
+});
+test('normalized exact lookup survives history pagination and failed search blocks prior invoice',async()=>{
+ const b=browser();b.run('persistenceMode="normalized"');b.replies.push(reply({invoice:'001',items:[],total:0}));await b.run('selectPrintInvoice("001")');assert.match(b.requests[0].url,/transaction-by-invoice\?invoice=001$/);
+ b.run('state.transactions=[{invoice:"someone-else"}];renderPrint()');assert.equal(b.run('selectedPrintTransaction().invoice'),'001');
+ b.replies.push(reply({message:'Not found'},404));await b.run('selectPrintInvoice("missing")');assert.equal(b.run('selectedPrintTransaction()'),null);
+ b.replies.push(reply({message:'Unavailable'},503));await b.run('realPrintDocument("invoice")');assert.equal(b.run('isPrinting'),false);assert.ok(b.messages.length);
+});
+test('out-of-order searches and changing selection during print cannot print another invoice',async()=>{
+ const b=browser(),slow=deferred();b.run('persistenceMode="normalized"');b.replies.push(slow.promise,reply({invoice:'B',items:[]}));const first=b.run('selectPrintInvoice("A")');await b.run('selectPrintInvoice("B")');slow.resolve(reply({invoice:'A',items:[]}));await first;assert.equal(b.run('selectedPrintTransaction().invoice'),'B');
+ const printing=deferred();b.replies.push(printing.promise);const work=b.run('realPrintDocument("faktur")');b.run('selectedPrintInvoice="C"');printing.resolve(reply({invoice:'B',items:[]}));await work;assert.equal(b.run('isPrinting'),false);assert.ok(b.messages.some(x=>/berubah/.test(x)));
+});
+for(const type of ['receipt','invoice','faktur'])test(`${type} rejects mismatched endpoint invoice`,async()=>{
+ const b=browser();b.run('persistenceMode="normalized";selectedPrintInvoice="A"');b.replies.push(reply({invoice:'B',items:[]}));await b.run(`realPrintDocument("${type}")`);assert.equal(b.run('isPrinting'),false);assert.ok(b.messages.some(x=>/diblokir/i.test(x)));
+});
+test('selection change while print frame loads cancels physical printing',async()=>{
+ const b=browser(),ready=deferred();let printed=0;b.context.frameReady=ready.promise;b.context.document.body={appendChild(){}};b.context.document.createElement=()=>({style:{},setAttribute(){},remove(){},contentDocument:{open(){},write(){},close(){}},contentWindow:{addEventListener(){},focus(){},print(){printed++}}});
+ transaction(b);b.run('selectedPrintInvoice="1";waitForPrintFrame=()=>frameReady');const work=b.run('realPrintDocument("receipt")');b.run('selectedPrintInvoice="2"');ready.resolve();await work;assert.equal(printed,0);assert.equal(b.run('isPrinting'),false);
+});
+for(const type of ['receipt','invoice','faktur'])test(`${type} prints exact API invoice after history page replacement`,async()=>{
+ const b=browser();let printed=0,html='';b.context.document.body={appendChild(){}};b.context.document.createElement=()=>({style:{},setAttribute(){},remove(){},contentDocument:{open(){},write(value){html=value},close(){}},contentWindow:{addEventListener(){},focus(){},print(){printed++}}});
+ b.run('persistenceMode="normalized";selectedPrintInvoice="EXACT-001";state.transactions=[{invoice:"WRONG-999"}];waitForPrintFrame=async()=>{}');b.replies.push(reply({invoice:'EXACT-001',customer:'Exact customer',items:[],total:0}));await b.run(`realPrintDocument("${type}")`);assert.equal(printed,1);assert.match(html,/EXACT-001/);assert.doesNotMatch(html,/WRONG-999/);assert.match(b.requests[0].url,/invoice=EXACT-001$/);
+});
+
+function installActionListeners(b){
+ const handlers={};b.context.document.addEventListener=(type,fn)=>{handlers[type]=fn};
+ b.run(source.slice(source.indexOf('document.addEventListener("submit"'),source.indexOf('$("#modal").addEventListener')));
+ return handlers;
+}
+function actionTarget(selector){return {id:selector.startsWith('#')?selector.slice(1):'',dataset:{productDelete:'p'},closest:query=>query.split(',').includes(selector)?{}:null};}
+function printConfiguration(b,key,value){const settings={...JSON.parse(b.run('JSON.stringify(state.settings)')),[key]:value};return {settings,categories:[],units:[],paymentMethods:['Tunai','DP','Transfer']};}
+for(const [id,key,value] of [['printReceiptType','receiptType','Invoice A4'],['printMethod','printMethod','Tidak Mencetak']])test(`normalized ${key} waits for confirmed configuration and survives reload`,async()=>{
+ const b=browser(),slow=deferred(),handlers=installActionListeners(b);b.run('persistenceMode="normalized"');const before=b.run(`state.settings.${key}`),record=printConfiguration(b,key,value);
+ b.replies.push(slow.promise);handlers.change({target:{id,value}});assert.equal(b.run(`state.settings.${key}`),before);assert.equal(b.node('#'+id).value,before);assert.equal(b.messages.length,0);
+ const request=b.requests[0];assert.match(request.url,/\/configuration$/);assert.equal(request.method,'PUT');assert.equal(JSON.parse(request.body).data.settings[key],value);assert.equal(JSON.parse(request.body).revision,1);assert.equal(JSON.parse(request.body).state,undefined);
+ queueRead(b,{admin:true,settings:record.settings});slow.resolve(reply({version:2,record}));await settle();await settle();assert.equal(b.run(`state.settings.${key}`),value);assert.ok(b.messages.some(x=>/dikonfirmasi/.test(x)));assert.equal(b.storage.size,0);
+ const fresh=browser();fresh.run('persistenceMode="normalized"');queueRead(fresh,{admin:true,settings:record.settings});await fresh.run('reloadNormalizedPage()');assert.equal(fresh.run(`state.settings.${key}`),value);assert.ok(b.requests.every(x=>!x.url.endsWith('/state')));
+});
+for(const status of [400,403,409,503])test(`print preference failure ${status} keeps confirmed settings and reports error`,async()=>{
+ const b=browser();b.run('persistenceMode="normalized"');const before=b.run('JSON.stringify(state.settings)');b.replies.push(reply({message:'Preference save failed'},status));b.run('savePrintPreference("printReceiptType","Invoice A4")');await settle();
+ assert.equal(b.run('JSON.stringify(state.settings)'),before);assert.ok(b.node('#saveStatus span').textContent.includes('Preference save failed'));assert.ok(!b.messages.some(x=>/dikonfirmasi/.test(x)));
+});
+test('lost print preference acknowledgement recovers exact command on fresh session',async()=>{
+ const b=browser();b.run('persistenceMode="normalized"');const record=printConfiguration(b,'receiptType','Invoice A4');b.replies.push(Promise.reject(new TypeError('offline')));b.run('savePrintPreference("printReceiptType","Invoice A4")');await settle();assert.equal(b.storage.size,1);
+ const fresh=browser(b.storage);fresh.run('persistenceMode="normalized"');fresh.replies.push(reply({version:2,record}));queueRead(fresh,{admin:true,settings:record.settings});assert.equal(fresh.run('recoverPendingOperation()'),true);await settle();await settle();
+ assert.equal(fresh.requests[0].body,b.requests[0].body);assert.equal(fresh.requests[0].headers['Idempotency-Key'],b.requests[0].headers['Idempotency-Key']);assert.equal(fresh.run('state.settings.receiptType'),'Invoice A4');assert.equal(b.storage.size,0);
+});
+test('normalized cashier and read-only preference changes are explicit no-ops',()=>{
+ for(const [mode,role] of [['normalized','KASIR'],['normalized-read','ADMINISTRATOR']]){const b=browser();b.run(`persistenceMode="${mode}";sessionUser.level="${role}"`);const before=b.run('JSON.stringify(state.settings)');b.run('savePrintPreference("printReceiptType","Invoice A4")');assert.equal(b.requests.length,0);assert.equal(b.run('JSON.stringify(state.settings)'),before);assert.ok(b.messages.length);}
+});
+test('legacy print preferences retain existing whole-state save behavior',()=>{
+ const b=browser();b.run('let preferenceSaves=0;saveState=()=>preferenceSaves++;savePrintPreference("printReceiptType","Invoice A4");savePrintPreference("printMethod","Tidak Mencetak")');assert.equal(b.run('preferenceSaves'),2);assert.equal(b.run('state.settings.receiptType'),'Invoice A4');assert.equal(b.run('state.settings.printMethod'),'Tidak Mencetak');
+});
+for(const mode of ['normalized','normalized-read'])for(const selector of ['[data-tx-delete]','[data-incoming-delete]','[data-stocktake-delete]','[data-product-delete]','[data-supplier-delete]','[data-customer-delete]','[data-ref-delete]','#resetAppBtn','#restoreDataBtn','#backupDataBtn','#exportIncomingBtn','#exportTransactionsBtn'])test(`${mode} blocks ${selector} before any side effect`,async()=>{
+ const b=browser(),handlers=installActionListeners(b);b.run(`persistenceMode="${mode}";saveState=()=>{throw new Error("Unexpected save")};csvDownload=()=>{throw new Error("Unexpected export")}`);b.context.confirm=()=>{throw new Error('Unexpected confirmation')};const before=b.run('JSON.stringify(state)'),draft=b.run('JSON.stringify(cart)');let prevented=false;
+ await handlers.click({target:actionTarget(selector),preventDefault(){prevented=true}});assert.equal(prevented,true);assert.equal(b.run('JSON.stringify(state)'),before);assert.equal(b.run('JSON.stringify(cart)'),draft);assert.equal(b.requests.length,0);assert.match(b.messages[0],/sementara tidak tersedia/);assert.equal(b.storage.size,0);
+});
+test('direct backup restore and history deletion paths are also guarded',()=>{
+ const b=browser();b.run('persistenceMode="normalized"');const before=b.run('JSON.stringify(state)');for(const code of ['backupData()','restoreData({})','deleteTransaction("1")','deleteIncomingRecord("1")'])b.run(code);assert.equal(b.run('JSON.stringify(state)'),before);assert.equal(b.requests.length,0);assert.equal(b.messages.length,4);
+});
+test('legacy deletion and complete catalogue exports remain available',async()=>{
+ const b=browser(),handlers=installActionListeners(b);b.run('let localSaves=0,downloads=0;saveState=()=>localSaves++;csvDownload=()=>downloads++');
+ const target=actionTarget('[data-product-delete]');target.closest=query=>query.split(',').includes('[data-product-delete]')?target:null;
+ await handlers.click({target,preventDefault(){}});assert.equal(b.run('state.products.length'),0);assert.equal(b.run('localSaves'),1);
+ for(const mode of ['legacy','normalized']){b.run(`persistenceMode="${mode}"`);for(const selector of ['#exportProductsBtn','#exportSuppliersBtn','#exportCustomersBtn'])await handlers.click({target:actionTarget(selector),preventDefault(){}});}
+ assert.equal(b.run('downloads'),6);
+});
+test('print preference adopts server-confirmed configuration rather than submitted draft',async()=>{
+ const b=browser();b.run('persistenceMode="normalized"');const record=printConfiguration(b,'receiptType','Faktur Penjualan A4');b.replies.push(reply({version:2,record}));queueRead(b,{admin:true,settings:record.settings});await b.run('savePrintPreference("printReceiptType","Invoice A4")');assert.equal(b.run('state.settings.receiptType'),'Faktur Penjualan A4');await settle();
+});
+test('incomplete configuration acknowledgement retains pending command without success',async()=>{
+ const b=browser();b.run('persistenceMode="normalized"');const before=b.run('JSON.stringify(state.settings)');b.replies.push(reply({version:2,record:{}}));b.run('savePrintPreference("printReceiptType","Invoice A4")');await settle();assert.equal(b.run('JSON.stringify(state.settings)'),before);assert.equal(b.storage.size,1);assert.match(b.node('#saveStatus span').textContent,/Konfirmasi pengaturan tidak lengkap/);assert.equal(b.messages.length,0);
 });

@@ -7,6 +7,7 @@ let users = [];
 let sessionUser = null;
 let cart = [];
 let selectedPrintInvoice = "";
+let printLookupSequence=0,printLookup=null,printLookupError="";
 let activeReference = "users";
 let selectedSupplierId = "";
 let transactionPage = 1;
@@ -31,6 +32,15 @@ let pendingRealtimeRefresh = null;
 let syncFailureCount = 0;
 let sessionGeneration = 0;
 let criticalSave = null;
+let persistenceMode = "legacy";
+let normalizedHistory = {total:0,pages:1};
+let normalizedDashboard = null;
+let normalizedPrintTransaction = null;
+let normalizedQueryTimer;
+let normalizedIncomingPage = 1;
+let normalizedStockPage = 1;
+let normalizedIncomingMeta = {total:0,pages:1};
+let normalizedStockMeta = {total:0,pages:1};
 let logoutRequest = null;
 const SYNC_DEBOUNCE_MS = 1000;
 const SYNC_RETRY_BASE_MS = 2000;
@@ -41,10 +51,17 @@ const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const money = n => new Intl.NumberFormat("id-ID",{maximumFractionDigits:0}).format(Number(n||0));
 const rupiah = n => "Rp" + money(n);
-const today = () => new Date().toISOString().slice(0,10);
+const BUSINESS_TIME_ZONE = "Asia/Jakarta";
+function businessDate(value=new Date()){
+  const parts=new Intl.DateTimeFormat("en-GB",{timeZone:BUSINESS_TIME_ZONE,year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(new Date(value));
+  const part=type=>parts.find(p=>p.type===type).value;return part("year")+"-"+part("month")+"-"+part("day");
+}
+const today = () => businessDate();
+// Historical day decisions come from migration; never reslice normalized timestamps.
+const transactionBusinessDate = t => t.businessDate ?? String(t.createdAt||"").slice(0,10);
 const nowLocal = () => {
-  const d=new Date(); const p=n=>String(n).padStart(2,"0");
-  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  const d=new Date(),time=new Intl.DateTimeFormat("en-GB",{timeZone:BUSINESS_TIME_ZONE,hour:"2-digit",minute:"2-digit",second:"2-digit",hourCycle:"h23"}).format(d);
+  return businessDate(d)+" "+time;
 };
 const esc = v => String(v??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));
 const timeoutSignal = () => typeof AbortSignal!=="undefined"&&typeof AbortSignal.timeout==="function"?AbortSignal.timeout(15000):undefined;
@@ -84,7 +101,7 @@ async function apiRequest(path,options={}){
     if(response.status===401){if(apiToken)logout();throw new Error("Sesi Anda telah berakhir. Silakan login kembali.")}
     const body=response.status===204?null:await response.json().catch(()=>null);
     if(generation!==sessionGeneration)throw new Error("Permintaan sesi lama diabaikan.");
-    if(!response.ok)throw new Error(body?.message||(response.status===403?"Anda tidak memiliki izin untuk melakukan tindakan ini.":"Permintaan tidak dapat diproses."));
+    if(!response.ok)throw Object.assign(new Error(body?.message||(response.status===403?"Anda tidak memiliki izin untuk melakukan tindakan ini.":"Permintaan tidak dapat diproses.")),{status:response.status});
     return body;
   }catch(error){
     if(error.name==="TimeoutError"||error.name==="AbortError")throw new Error("Waktu tunggu server habis. Coba kembali.");
@@ -104,13 +121,13 @@ function canSettleTransaction(transaction){return hasPermission("transactions-se
 function getInitialTransactionCashIn(transaction){return Number((transaction.cashIn??(transaction.paymentMethod==="DP"?transaction.downPayment:transaction.total))||0)}
 function getTransactionCashIn(transaction){return getTransactionPaidTotal(transaction)}
 function getTransactionCashInOnDate(transaction,date){
-  const initialDate=String(transaction.createdAt||"").slice(0,10);
+  const initialDate=transactionBusinessDate(transaction);
   const initial=initialDate===date?getInitialTransactionCashIn(transaction):0;
   return initial+(transaction.paymentHistory||[]).filter(payment=>payment.date===date).reduce((sum,payment)=>sum+Number(payment.amount||0),0);
 }
 function getTransactionPaymentsOnDate(transaction,date){
   const rows=[];
-  if(String(transaction.createdAt||"").slice(0,10)===date)rows.push({method:transaction.paymentMethod||"-",amount:getInitialTransactionCashIn(transaction)});
+  if(transactionBusinessDate(transaction)===date)rows.push({method:transaction.paymentMethod||"-",amount:getInitialTransactionCashIn(transaction)});
   (transaction.paymentHistory||[]).filter(payment=>payment.date===date).forEach(payment=>rows.push({method:payment.method||"Pelunasan",amount:Number(payment.amount||0)}));
   return rows;
 }
@@ -185,12 +202,14 @@ function mergeValue(base,local,remote){
 }
 function normalizeInMemoryState(){state=migrateState(state);}
 async function getServerState(signal=timeoutSignal()){
+  if(persistenceMode!=="legacy")return getNormalizedState(signal);
   const response=await fetch(`${API_BASE_URL}/state`,{credentials:"include",signal,cache:"no-store"});
   if(response.status===401)throw new Error("Sesi login berakhir.");
   if(!response.ok){const body=await response.json().catch(()=>null);throw new Error(body?.message||"Data server tidak dapat dimuat.")}
   return response.json();
 }
 async function getServerStateVersion(signal){
+  if(persistenceMode!=="legacy")return (await apiRequest("/sync",{signal})).version;
   const response=await fetch(`${API_BASE_URL}/state/version`,{credentials:"include",signal,cache:"no-store"});
   if(response.status===401)throw new Error("Sesi login berakhir.");
   if(!response.ok)throw new Error("Versi data server tidak dapat dimuat.");
@@ -236,6 +255,7 @@ function hasOperation(payload,id){
     record.saveOperationId===id||(record.quantityEdits||[]).some(edit=>edit.id===id)||(record.paymentHistory||[]).some(payment=>payment.id===id));
 }
 function retryCriticalSave(){
+  if(criticalSave?.request){sendNormalizedOperation();return}
   if(!criticalSave||syncInFlight)return;
   syncFailureCount=0;syncErrorShown=false;
   criticalStatus("Mencoba ulang penyimpanan yang sama — menunggu server.");
@@ -317,6 +337,7 @@ function queueServerSync(delay=SYNC_DEBOUNCE_MS){
   clearTimeout(serverSyncTimer);serverSyncTimer=setTimeout(syncServerState,delay);
 }
 function saveState(){
+  if(persistenceMode!=="legacy")throw new Error("Gunakan API operasi; penyimpanan state dinonaktifkan.");
   normalizeInMemoryState();stateDirty=!sameValue(statePayload(),lastSyncedState);
   clearTimeout(serverSyncTimer);
   if(stateDirty){syncFailureCount=0;queueServerSync()}
@@ -327,6 +348,7 @@ function flushPendingRealtimeRefresh(activeGeneration){
   refreshServerState(pending);
 }
 async function refreshServerState({notify=false,version}={}){
+  if(persistenceMode!=="legacy"&&criticalSave)return;
   if(!apiToken||stateDirty||syncInFlight||refreshInFlight||document.visibilityState==="hidden"||$("#modal")?.classList.contains("open"))return;
   const hasEventVersion=Number.isSafeInteger(version)&&version>=0;
   if(hasEventVersion&&version<=serverStateVersion)return;
@@ -342,7 +364,7 @@ async function refreshServerState({notify=false,version}={}){
     if(!stillCurrent())return;
     serverStateRequestLimit=Number(remote.maxRequestBytes||serverStateRequestLimit);
     if(serverStateVersion===null||remoteVersion>serverStateVersion){
-      const currentUser=state.currentUser;state=migrateState(remote.state||{}, {log:true});state.currentUser=currentUser;normalizeInMemoryState();serverStateVersion=remoteVersion;lastSyncedState=statePayload();renderAll();if(notify)toast("Data terbaru dari server telah dimuat.");
+      const currentUser=state.currentUser;state=migrateState(remote.state||{}, {log:true});state.currentUser=currentUser;applyNormalizedRead(remote);normalizeInMemoryState();serverStateVersion=remoteVersion;lastSyncedState=statePayload();renderAll();if(notify)toast("Data terbaru dari server telah dimuat.");
     }
     syncErrorShown=false;
   }catch(error){
@@ -357,7 +379,7 @@ async function refreshServerState({notify=false,version}={}){
     }
   }
 }
-function realtimeConnected(){return Boolean(window.KASIR_REALTIME?.isConnected?.())}
+function realtimeConnected(){return persistenceMode==="legacy"&&Boolean(window.KASIR_REALTIME?.isConnected?.())}
 function scheduleFallbackRefresh(delay=FALLBACK_REFRESH_MS){
   clearTimeout(serverRefreshTimer);
   if(!apiToken||realtimeConnected()||document.visibilityState==="hidden")return;
@@ -366,6 +388,7 @@ function scheduleFallbackRefresh(delay=FALLBACK_REFRESH_MS){
 }
 function startServerRefresh(){
   clearTimeout(serverRefreshTimer);if(!apiToken)return;
+  if(persistenceMode!=="legacy"){window.KASIR_REALTIME?.unsubscribe();scheduleFallbackRefresh();return}
   const activeGeneration=sessionGeneration;
   window.KASIR_REALTIME?.subscribe(
     version=>{
@@ -377,8 +400,127 @@ function startServerRefresh(){
   );
   scheduleFallbackRefresh();
 }
+// Temporary adapter: visible pages only; historical data never enters a state PUT.
+async function getNormalizedState(signal){
+  const generation=sessionGeneration;
+  for(let attempt=0;attempt<3;attempt++){
+    try{
+      const boot=await apiRequest("/bootstrap",{signal});
+      if(!Number.isSafeInteger(boot.version))throw new Error("Revisi server tidak valid.");
+      const params=new URLSearchParams({page:transactionPage,limit:10,expectedRevision:boot.version});
+      for(const [key,selector] of [["search","#transactionSearch"],["date","#transactionDateFilter"],["paymentMethod","#transactionPaymentFilter"]])if($(selector)?.value)params.set(key,$(selector).value);
+      const requests=[apiRequest(`/transactions?${params}`,{signal}),apiRequest(`/dashboard?date=${$("#dashboardDate")?.value||today()}&expectedRevision=${boot.version}`,{signal})];
+      if(currentUser()?.level==="ADMINISTRATOR"){
+        for(const [path,page,search,date] of [["incoming",normalizedIncomingPage,"#incomingSearch","#incomingDateFilter"],["stocktakes",normalizedStockPage,"#stockSearch","#stockDateFilter"]]){
+          const query=new URLSearchParams({page,limit:20,expectedRevision:boot.version});
+          if($(search)?.value)query.set("search",$(search).value);if($(date)?.value)query.set("date",$(date).value);
+          requests.push(apiRequest(`/${path}?${query}`,{signal}));
+        }
+      }
+      const settled=await Promise.allSettled(requests),failed=settled.find(r=>r.status==="rejected");
+      if(failed)throw failed.reason;
+      if(generation!==sessionGeneration||signal?.aborted)throw new Error("Permintaan sesi lama diabaikan.");
+      const [history,dashboard,incoming,stock]=settled.map(r=>r.value);
+      if(serverStateVersion!==null&&boot.version<serverStateVersion)throw Object.assign(new Error("Revisi data berubah."),{status:409});
+      boot.normalizedViews={history,dashboard,incoming:incoming||{total:0,pages:1},stock:stock||{total:0,pages:1}};
+      boot.state.transactions=history.rows;boot.state.incoming=incoming?.rows||[];boot.state.stocktakes=stock?.rows||[];
+      return boot;
+    }catch(error){if(error.status!==409||attempt===2||signal?.aborted||generation!==sessionGeneration)throw error;}
+  }
+}
+function applyNormalizedRead(remote){
+  if(!remote.normalizedViews)return;
+  const {history,dashboard,incoming,stock}=remote.normalizedViews;
+  normalizedHistory=history;normalizedDashboard=dashboard;normalizedIncomingMeta=incoming;normalizedStockMeta=stock;
+}
+async function reloadNormalizedPage(){
+  if(persistenceMode==="legacy"||criticalSave)return;
+  refreshController?.abort();
+  const generation=sessionGeneration,controller=new AbortController();refreshController=controller;refreshInFlight=true;
+  const signal=requestSignal(controller);
+  try{const remote=await getNormalizedState(signal);if(generation!==sessionGeneration||!apiToken||signal.aborted||refreshController!==controller)return;const user=state.currentUser;state=migrateState(remote.state);state.currentUser=user;applyNormalizedRead(remote);serverStateVersion=remote.version;renderAll()}
+  catch(error){if(generation===sessionGeneration&&!controller.signal.aborted)toast(error.message)}
+  finally{signal.dispose?.();if(refreshController===controller){refreshController=null;refreshInFlight=false}}
+}
+let criticalSaveResult=null;
+const PENDING_OPERATION_PREFIX="kasir.pending.v1:";
+const pendingStorageKey=op=>PENDING_OPERATION_PREFIX+encodeURIComponent(op.actor)+":"+op.id;
+function pendingOperations(actor){
+  const records=[];
+  for(let i=0;i<localStorage.length;i++){
+    const key=localStorage.key(i);if(!key?.startsWith(PENDING_OPERATION_PREFIX+encodeURIComponent(actor)+":"))continue;
+    const op=JSON.parse(localStorage.getItem(key));
+    if(op.actor!==actor)continue;
+    if(typeof op.id!=="string"||!/^OP-[a-zA-Z0-9_-]+$/.test(op.id)||typeof op.body!=="string"||op.body.length>65536||!Number.isFinite(op.timestamp)||pendingStorageKey(op)!==key||
+      !((op.method==="POST"&&/^\/(transactions|incoming|stocktakes|products|customers|suppliers|transactions\/[^/]+\/payments)$/.test(op.path))||(op.method==="PATCH"&&/^\/transactions\/[^/]+\/items$/.test(op.path))||(op.method==="PUT"&&op.path==="/configuration")))throw new Error("Data operasi tertunda perlu diperiksa; penyimpanan diblokir.");
+    const payload=JSON.parse(op.body),inspect=x=>{if(x&&typeof x==="object")for(const [k,v] of Object.entries(x)){if(/password|jwt|secret|cookie|token/i.test(k))throw new Error("Kredensial tidak boleh disimpan dalam operasi.");inspect(v)}};inspect(payload);
+    records.push(op);
+  }
+  return records.sort((a,b)=>a.timestamp-b.timestamp||a.id.localeCompare(b.id));
+}
+function persistPendingOperation(op){
+  const inspect=x=>{if(x&&typeof x==="object")for(const [key,value] of Object.entries(x)){if(/password|jwt|secret|cookie|token/i.test(key))throw new Error("Kredensial tidak boleh disimpan dalam operasi.");inspect(value)}};inspect(JSON.parse(op.body));
+  let count=0;for(let i=0;i<localStorage.length;i++)if(localStorage.key(i)?.startsWith(PENDING_OPERATION_PREFIX))count++;
+  if(count>=16)throw new Error("Selesaikan operasi tertunda sebelum menyimpan lagi.");
+  if(op.body.length>65536)throw new Error("Operasi terlalu besar.");
+  localStorage.setItem(pendingStorageKey(op),JSON.stringify(op));
+}
+function removePendingOperation(operation){
+  try{localStorage.removeItem(pendingStorageKey(operation.durable));return true}catch{toast("Konfirmasi diterima, tetapi catatan pemulihan belum dapat dibersihkan. Operasi yang sama aman dipulihkan kembali.");return false}
+}
+function recoverPendingOperation(){
+  if(persistenceMode!=="normalized"||!sessionUser||criticalSave||syncInFlight)return false;
+  try{
+    const op=pendingOperations(sessionUser.id)[0];if(!op)return false;
+    let resolve;const promise=new Promise(done=>{resolve=done});
+    criticalSave={id:op.id,promise,resolve,durable:op,recovered:true,before:null,request:{path:op.path,method:op.method,body:op.body},confirmed:()=>{if(criticalSaveResult.transaction)selectedPrintInvoice=criticalSaveResult.transaction.invoice;renderAll();toast("Operasi tertunda dikonfirmasi server.")}};
+    lockCriticalForm(true);sendNormalizedOperation();return true;
+  }catch(error){criticalStatus(error.message);return true;}
+}
+function normalizedOperation(path,method,body,confirmed){
+  if(criticalSave)return criticalSave.promise;
+  if(refreshInFlight){toast("Tunggu pembaruan data selesai sebelum menyimpan.");return Promise.resolve(false)}
+  if(persistenceMode!=="normalized"){toast("Mode verifikasi hanya baca. Data belum dapat diubah.");return Promise.resolve(false)}
+  if(recoverPendingOperation())return criticalSave?.promise||Promise.resolve(false);
+  let resolve;const promise=new Promise(done=>{resolve=done});const id=nextId("OP");
+  const durable={actor:sessionUser.id,id,path,method,body:JSON.stringify(body),timestamp:Date.now()};
+  try{persistPendingOperation(durable)}catch(error){criticalStatus("Operasi belum dikirim: "+error.message);return Promise.resolve(false)}
+  criticalSave={id,promise,resolve,durable,before:null,confirmed:()=>confirmed(criticalSaveResult),request:{path,method,body:durable.body}};
+  lockCriticalForm(true);sendNormalizedOperation();return promise;
+}
+async function sendNormalizedOperation(){
+  const operation=criticalSave;if(!operation?.request||syncInFlight)return;
+  syncInFlight=true;const generation=sessionGeneration,controller=new AbortController();syncController=controller;
+  const signal=requestSignal(controller);criticalStatus("Menyimpan — menunggu konfirmasi server.");
+  let acknowledged=false,clearedPending=false;
+  try{
+    const r=operation.request;
+    const result=await apiRequest(r.path,{method:r.method,body:r.body,headers:{"Idempotency-Key":operation.id},signal});
+    if(generation!==sessionGeneration||criticalSave!==operation)return;
+    const expectsTransaction=r.path==="/transactions"||/^\/transactions\/[^/]+\/(payments|items)$/.test(r.path);
+    if(!result||!Number.isSafeInteger(result.version)||(expectsTransaction?typeof result.transaction?.id!=="string"||typeof result.transaction?.invoice!=="string":!result.record||typeof result.record!=="object"||Array.isArray(result.record)))throw new Error("Konfirmasi server tidak lengkap; ulangi operasi yang sama.");
+    if(r.path==="/configuration"&&(!result.record.settings||typeof result.record.settings!=="object"||Array.isArray(result.record.settings)||!["categories","units","paymentMethods"].every(key=>Array.isArray(result.record[key]))))throw new Error("Konfirmasi pengaturan tidak lengkap; ulangi operasi yang sama.");
+    clearedPending=removePendingOperation(operation);acknowledged=true;
+    criticalSaveResult=result;
+    if(r.path==="/configuration")for(const key of ["settings","categories","units","paymentMethods"])state[key]=clone(result.record[key]);
+    // Adopt the revision only after a coherent bounded refresh.
+    if(result.transaction){const t=normalizeTransaction(result.transaction);state.transactions=[t,...state.transactions.filter(x=>x.id!==t.id)].slice(0,10)}
+    if(result.transaction)normalizedPrintTransaction=normalizeTransaction(result.transaction);
+    for(const p of result.products||[]){const index=state.products.findIndex(x=>x.id===p.id);if(index>=0)state.products[index]=p;else state.products.push(p)}
+    if(result.record&&r.path==="/incoming")state.incoming=[result.record,...state.incoming].slice(0,20);
+    if(result.record&&r.path==="/stocktakes")state.stocktakes=[result.record,...state.stocktakes].slice(0,20);
+    finishCriticalSave(true);
+  }catch(error){
+    if(generation!==sessionGeneration||criticalSave!==operation)return;
+    if([400,403,409,413,415,422].includes(error.status)){removePendingOperation(operation);finishCriticalSave(false,error.message+(operation.recovered?" Operasi tertunda ditolak; periksa data sebelum membuat operasi baru.":" Input tetap tersedia."));}
+    else criticalStatus(error.message+" Gunakan Coba lagi untuk operasi yang sama; jangan tutup halaman.",true);
+  }finally{
+    signal.dispose?.();if(syncController===controller){syncController=null;syncInFlight=false}
+    if(acknowledged&&generation===sessionGeneration&&apiToken){await reloadNormalizedPage();if(clearedPending&&generation===sessionGeneration)recoverPendingOperation();}
+  }
+}
 state=loadState();
-selectedPrintInvoice=state.transactions[0]?.invoice||"";
+selectedPrintInvoice="";
 selectedSupplierId=state.suppliers[0]?.id||"";
 function toast(t){
   const el=$("#toast"); el.textContent=t; el.classList.add("show");
@@ -391,6 +533,7 @@ function closeModal(){ if(criticalSave)return;$("#modal").classList.remove("open
 function uniqueSuffix(){return crypto.randomUUID?.().replaceAll("-","")||`${Date.now().toString(36)}${Math.random().toString(36).slice(2,10)}`}
 function nextId(prefix){return `${prefix}-${uniqueSuffix()}`}
 function nextInvoice(){
+  if(persistenceMode!=="legacy")return "Otomatis saat disimpan";
   const sequenceNumbers=state.transactions
     .map(transaction=>String(transaction.invoice??""))
     .filter(invoice=>/^\d{1,9}$/.test(invoice))
@@ -398,7 +541,7 @@ function nextInvoice(){
   return String(sequenceNumbers.length?Math.max(...sequenceNumbers)+1:0);
 }
 function formatDateTime(v){
-  try{return new Intl.DateTimeFormat("id-ID",{dateStyle:"short",timeStyle:"medium"}).format(new Date(v))}
+  try{return new Intl.DateTimeFormat("id-ID",{dateStyle:"short",timeStyle:"medium",timeZone:BUSINESS_TIME_ZONE}).format(new Date(v))}
   catch{return v}
 }
 function productById(id){return state.products.find(p=>p.id===id)}
@@ -431,6 +574,7 @@ function csvDownload(filename,headers,rows){
   a.download=filename; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),500);
 }
 function backupData(){
+  if(persistenceMode!=="legacy")return toast("Backup lengkap memerlukan ekspor database melalui prosedur migrasi; halaman ini hanya memuat sebagian riwayat.");
   if(!requirePermission("backup"))return;
   state.lastBackupAt=new Date().toISOString(); saveState();
   const blob=new Blob([JSON.stringify(statePayload(),null,2)],{type:"application/json"}), a=document.createElement("a");
@@ -438,13 +582,14 @@ function backupData(){
   toast("Backup data berhasil dibuat.");
 }
 function restoreData(file){
+  if(persistenceMode!=="legacy")return toast("Restore state dinonaktifkan setelah migrasi. Gunakan prosedur pemulihan database.");
   if(!requirePermission("backup")||!file)return;
   const reader=new FileReader();reader.onload=()=>{
     try{
       const parsed=JSON.parse(reader.result);
       if(!parsed||typeof parsed!=="object"||!Array.isArray(parsed.products)||!Array.isArray(parsed.transactions)||JSON.stringify(parsed).match(/password|password_hash|token|jwt|secret|supabase/i))throw new Error("Struktur backup tidak valid");
       if(!confirm("Restore akan mengganti seluruh data aplikasi saat ini. Lanjutkan?"))return;
-      state=migrateState(parsed,{log:true});saveState();cart=[];selectedPrintInvoice=state.transactions[0]?.invoice||"";renderAll();toast("Data berhasil dipulihkan.");
+      state=migrateState(parsed,{log:true});saveState();cart=[];selectedPrintInvoice="";renderAll();toast("Data berhasil dipulihkan.");
     }catch(error){toast("File backup tidak valid atau rusak.");}
   };reader.readAsText(file);
 }
@@ -466,14 +611,17 @@ async function login(username,password){
 }
 async function activateSession(user){
   sessionGeneration++;apiToken="cookie";sessionUser=user;
+  persistenceMode=user.persistenceMode||"legacy";
   const generation=sessionGeneration;
   let remote;
   try{remote=await getServerState()}catch(error){if(generation===sessionGeneration){apiToken="";sessionUser=null;toast(error.message)}throw error}
   if(generation!==sessionGeneration||!apiToken)return;
   const hasRemoteState=Boolean(remote?.state&&Object.keys(remote.state).length);
   if(hasRemoteState)state=migrateState(remote.state,{log:true});
+  applyNormalizedRead(remote);
   serverStateVersion=Number(remote?.version||0);serverStateRequestLimit=Number(remote?.maxRequestBytes||serverStateRequestLimit);lastSyncedState=clone(remote?.state||{});stateDirty=!hasRemoteState;syncErrorShown=false;syncFailureCount=0;
   state.currentUser=user.username;normalizeInMemoryState();showApp();if(stateDirty)queueServerSync();
+  if(persistenceMode==="normalized")recoverPendingOperation();
 }
 async function restoreSession(){
   const generation=sessionGeneration;
@@ -504,6 +652,7 @@ function updateNavigationPermissions(){
   $$("#topNav [data-page]").forEach(button=>button.classList.toggle("hidden",admin?false:!cashierPages.has(button.dataset.page)));
 }
 function logout(){
+  clearTimeout(normalizedQueryTimer);printLookupSequence++;printLookup=null;printLookupError="";selectedPrintInvoice="";normalizedPrintTransaction=null;normalizedDashboard=null;transactionPage=1;normalizedIncomingPage=1;normalizedStockPage=1;
   if(!apiToken&&logoutRequest)return;
   pendingRealtimeRefresh=null;
   sessionGeneration++;apiToken="";syncController?.abort();syncController=null;syncInFlight=false;refreshController?.abort();refreshController=null;refreshInFlight=false;
@@ -591,22 +740,46 @@ function renderSettings(){
 
 function renderDashboard(){
   if(!$("#dashboardDate").value)$("#dashboardDate").value=today();const selectedDate=$("#dashboardDate").value;
-  const daily=state.transactions.filter(t=>String(t.createdAt||"").slice(0,10)===selectedDate),sales=daily.reduce((s,t)=>s+Number(t.total||0),0),profit=daily.reduce((s,t)=>s+t.items.reduce((a,i)=>a+Number(i.profit||0),0),0),moneyIn=state.transactions.reduce((s,t)=>s+getTransactionCashInOnDate(t,selectedDate),0),receivable=state.transactions.reduce((s,t)=>s+Number(t.remaining||0),0);
+  const aggregate=persistenceMode!=="legacy"?normalizedDashboard:null;
+  if(persistenceMode!=="legacy"&&!aggregate)return;
+  const daily=aggregate?aggregate.recent:state.transactions.filter(t=>transactionBusinessDate(t)===selectedDate),sales=aggregate?Number(aggregate.sales):daily.reduce((s,t)=>s+Number(t.total||0),0),profit=aggregate?Number(aggregate.profit):daily.reduce((s,t)=>s+t.items.reduce((a,i)=>a+Number(i.profit||0),0),0),moneyIn=aggregate?Number(aggregate.moneyIn):state.transactions.reduce((s,t)=>s+getTransactionCashInOnDate(t,selectedDate),0),receivable=aggregate?Number(aggregate.receivable):state.transactions.reduce((s,t)=>s+Number(t.remaining||0),0);
   const lowStocks=state.products.filter(p=>p.trackStock&&Number(p.stock||0)<=Number(p.minStock||0)),emptyStocks=lowStocks.filter(p=>Number(p.stock||0)<=0),unpaid=state.transactions.filter(t=>t.paymentStatus==="BELUM LUNAS");
-  const payments=state.transactions.reduce((m,t)=>{getTransactionPaymentsOnDate(t,selectedDate).forEach(payment=>{m[payment.method]=(m[payment.method]||0)+payment.amount});return m},{});
-  $("#dashboardKpis").innerHTML=`<article><div><small>Penjualan Hari Ini</small><strong>${rupiah(sales)}</strong><p>${daily.length} transaksi</p></div></article>${hasPermission("dashboard-profit")?`<article class="green"><div><small>Laba Kotor Hari Ini</small><strong>${rupiah(profit)}</strong><p>${sales?((profit/sales)*100).toFixed(1):0}% dari penjualan</p></div></article>`:""}<article class="purple"><div><small>Uang Masuk Hari Ini</small><strong>${rupiah(moneyIn)}</strong><p>${Object.entries(payments).map(([k,v])=>`${esc(k)}: ${rupiah(v)}`).join(", ")||"Belum ada pembayaran"}</p></div></article><article class="orange"><div><small>Stok Bermasalah</small><strong>${lowStocks.length}</strong><p>${emptyStocks.length} habis, ${lowStocks.length-emptyStocks.length} menipis</p></div></article><article class="cyan"><div><small>Piutang / Sisa</small><strong>${rupiah(receivable)}</strong><p>${unpaid.length} transaksi belum lunas</p></div></article>`;
-  const days=[];for(let i=6;i>=0;i--){const d=new Date(selectedDate+"T00:00:00");d.setDate(d.getDate()-i);const key=d.toISOString().slice(0,10),tx=state.transactions.filter(t=>String(t.createdAt||"").slice(0,10)===key);days.push({label:key.slice(8,10)+"/"+key.slice(5,7),sales:tx.reduce((s,t)=>s+Number(t.total||0),0),profit:tx.reduce((s,t)=>s+t.items.reduce((a,x)=>a+Number(x.profit||0),0),0)})}const max=Math.max(...days.map(x=>x.sales),1);
-  $("#dashboardChart").innerHTML=`<div class="chart-legend"><span class="sales-legend">Penjualan</span><span class="profit-legend">Laba Kotor</span></div><div class="chart-bars">${days.map(x=>`<div><span class="sales-bar" style="height:${Math.max(3,x.sales/max*150)}px"></span><span class="profit-bar" style="height:${Math.max(2,x.profit/max*150)}px"></span><small>${x.label}</small><b>${x.sales?rupiah(x.sales):"Rp0"}</b></div>`).join("")}</div>`;
+  const payments=aggregate?aggregate.payments:state.transactions.reduce((m,t)=>{getTransactionPaymentsOnDate(t,selectedDate).forEach(payment=>{m[payment.method]=(m[payment.method]||0)+payment.amount});return m},{});
+  $("#dashboardKpis").innerHTML=`<article><div><small>Penjualan Hari Ini</small><strong>${rupiah(sales)}</strong><p>${aggregate?aggregate.count:daily.length} transaksi</p></div></article>${hasPermission("dashboard-profit")?`<article class="green"><div><small>Laba Kotor Hari Ini</small><strong>${rupiah(profit)}</strong><p>${sales?((profit/sales)*100).toFixed(1):0}% dari penjualan</p></div></article>`:""}<article class="purple"><div><small>Uang Masuk Hari Ini</small><strong>${rupiah(moneyIn)}</strong><p>${Object.entries(payments).map(([k,v])=>`${esc(k)}: ${rupiah(v)}`).join(", ")||"Belum ada pembayaran"}</p></div></article><article class="orange"><div><small>Stok Bermasalah</small><strong>${lowStocks.length}</strong><p>${emptyStocks.length} habis, ${lowStocks.length-emptyStocks.length} menipis</p></div></article><article class="cyan"><div><small>Piutang / Sisa</small><strong>${rupiah(receivable)}</strong><p>${aggregate?aggregate.unpaidCount:unpaid.length} transaksi belum lunas</p></div></article>`;
+  const days=aggregate?aggregate.days:[];if(!aggregate)for(let i=6;i>=0;i--){const d=new Date(selectedDate+"T12:00:00Z");d.setUTCDate(d.getUTCDate()-i);const key=d.toISOString().slice(0,10),tx=state.transactions.filter(t=>transactionBusinessDate(t)===key);days.push({label:key.slice(8,10)+"/"+key.slice(5,7),sales:tx.reduce((s,t)=>s+Number(t.total||0),0),profit:tx.reduce((s,t)=>s+t.items.reduce((a,x)=>a+Number(x.profit||0),0),0)})}const max=Math.max(...days.map(x=>x.sales),1);
+  $("#dashboardChart").innerHTML=`<div class="chart-legend"><span class="sales-legend">Penjualan</span>${hasPermission("dashboard-profit")?`<span class="profit-legend">Laba Kotor</span>`:""}</div><div class="chart-bars">${days.map(x=>`<div><span class="sales-bar" style="height:${Math.max(3,x.sales/max*150)}px"></span>${hasPermission("dashboard-profit")?`<span class="profit-bar" style="height:${Math.max(2,x.profit/max*150)}px"></span>`:""}<small>${x.label}</small><b>${x.sales?rupiah(x.sales):"Rp0"}</b></div>`).join("")}</div>`;
   $("#dashboardStockIssues").innerHTML=lowStocks.slice(0,8).map(p=>`<div class="dashboard-data-row"><span><b>${esc(p.name)}</b><small>Minimum ${money(p.minStock)} ${esc(p.unit)}</small></span><strong class="${p.stock<=0?"negative":""}">${money(p.stock)} ${esc(p.unit)}</strong></div>`).join("")||`<p class="dashboard-empty">Semua stok masih aman.</p>`;
   $("#dashboardRecentTransactions").innerHTML=daily.slice(0,6).map(t=>`<div class="dashboard-data-row"><span><b>${esc(t.invoice)}</b><small>${esc(t.customer||"UMUM")} · ${esc(t.paymentMethod)}</small></span><strong>${rupiah(t.total)}</strong></div>`).join("")||`<p class="dashboard-empty">Belum ada transaksi pada tanggal ini.</p>`;
-  const productSales={};daily.forEach(t=>t.items.forEach(i=>{const x=productSales[i.productId]||(productSales[i.productId]={name:i.name,qty:0,revenue:0,profit:0});x.qty+=Number(i.qty||0);x.revenue+=Number(i.amount||0);x.profit+=Number(i.profit||0)}));const topProducts=Object.values(productSales).sort((a,b)=>b.qty-a.qty).slice(0,6);
+  const productSales={};if(!aggregate)daily.forEach(t=>t.items.forEach(i=>{const x=productSales[i.productId]||(productSales[i.productId]={name:i.name,qty:0,revenue:0,profit:0});x.qty+=Number(i.qty||0);x.revenue+=Number(i.amount||0);x.profit+=Number(i.profit||0)}));const topProducts=aggregate?aggregate.topProducts:Object.values(productSales).sort((a,b)=>b.qty-a.qty).slice(0,6);
   $("#dashboardTopProducts").innerHTML=topProducts.map((x,i)=>`<div class="dashboard-data-row ranked"><i>${i+1}</i><span><b>${esc(x.name)}</b><small>${money(x.qty)} terjual</small></span><strong>${rupiah(x.revenue)}</strong></div>`).join("")||`<p class="dashboard-empty">Belum ada produk terjual.</p>`;
-  const allReceivable=unpaid.reduce((sum,t)=>sum+Number(t.remaining||0),0);
-  $("#dashboardNotifications").innerHTML=`<p class="critical">${emptyStocks.length} produk stok habis</p><p class="warning">${lowStocks.length-emptyStocks.length} produk stok menipis</p>${unpaid.length?`<p class="warning">${unpaid.length} transaksi belum lunas · ${rupiah(allReceivable)}</p>`:`<p class="success">Semua transaksi sudah lunas</p>`}${state.lastBackupAt?`<p class="success">Backup terakhir: ${formatDateTime(state.lastBackupAt)}</p>`:""}`;
+  const allReceivable=aggregate?receivable:unpaid.reduce((sum,t)=>sum+Number(t.remaining||0),0);
+  $("#dashboardNotifications").innerHTML=`<p class="critical">${emptyStocks.length} produk stok habis</p><p class="warning">${lowStocks.length-emptyStocks.length} produk stok menipis</p>${(aggregate?aggregate.unpaidCount:unpaid.length)?`<p class="warning">${aggregate?aggregate.unpaidCount:unpaid.length} transaksi belum lunas · ${rupiah(allReceivable)}</p>`:`<p class="success">Semua transaksi sudah lunas</p>`}${state.lastBackupAt?`<p class="success">Backup terakhir: ${formatDateTime(state.lastBackupAt)}</p>`:""}`;
 }
+// Shared preferences use the existing administrator-only configuration command.
+function savePrintPreference(id,value){
+  if(!requirePermission("print"))return;
+  const key=id==="printMethod"?"printMethod":"receiptType";
+  if(persistenceMode==="legacy"){
+    state.settings[key]=value;saveState();if(key==="receiptType")renderPrint();
+    toast(key==="receiptType"?"Jenis nota disimpan.":"Metode cetak disimpan.");return;
+  }
+  // The control reflects confirmed state until the server acknowledges this change.
+  $("#"+id).value=state.settings[key];
+  if(currentUser()?.level!=="ADMINISTRATOR")return toast("Preferensi cetak bersama hanya dapat disimpan oleh ADMINISTRATOR.");
+  if(criticalSave)return toast("Selesaikan penyimpanan yang sedang berlangsung sebelum mengubah preferensi cetak.");
+  const settings={...clone(state.settings),[key]:value};
+  return normalizedOperation("/configuration","PUT",{revision:serverStateVersion,data:{settings,categories:clone(state.categories),units:clone(state.units),paymentMethods:clone(state.paymentMethods)}},()=>{renderPrint();toast("Preferensi cetak dikonfirmasi server.")});
+}
+const NORMALIZED_UNAVAILABLE_ACTIONS="[data-tx-delete],[data-incoming-delete],[data-product-delete],[data-supplier-delete],[data-customer-delete],[data-stocktake-delete],[data-ref-delete],#resetAppBtn,#restoreDataBtn,#backupDataBtn,#exportIncomingBtn,#exportTransactionsBtn";
+function blockUnavailableNormalizedAction(target){
+  if(persistenceMode==="legacy"||!target.closest(NORMALIZED_UNAVAILABLE_ACTIONS))return false;
+  toast("Fitur ini sementara tidak tersedia dalam mode normalized. Tidak ada data yang diubah atau diekspor; gunakan prosedur administrasi database yang ditinjau.");return true;
+}
+
 function saveSettings(e){
   if(!requirePermission("settings")){e.preventDefault();return}
   e.preventDefault();
+  const previousSettings=clone(state.settings);
   const map={
     setStoreName:"storeName",setAddress:"address",setPhone:"phone",setEmail:"email",
     setCashier:"defaultCashier",setDiscountMethod:"discountMethod",setTax:"taxPercent",setBank1Name:"bank1Name",setBank1Number:"bank1Number",
@@ -618,6 +791,7 @@ function saveSettings(e){
   Object.entries(map).forEach(([id,key])=>{
     state.settings[key]=id==="setTax"?Number($("#"+id).value||0):$("#"+id).value.trim();
   });
+  if(persistenceMode!=="legacy"){const settings=clone(state.settings);state.settings=previousSettings;return normalizedOperation("/configuration","PUT",{revision:serverStateVersion,data:{settings,categories:state.categories,units:state.units,paymentMethods:state.paymentMethods}},()=>{renderAll();toast("Pengaturan dikonfirmasi server.")})}
   saveState(); renderAll(); toast("Pengaturan disimpan.");
 }
 
@@ -753,8 +927,8 @@ function renderIncoming(){
   $("#incomingProductOptions").innerHTML=activeProducts.map(product=>`<option value="${esc(product.name)}" label="Stok ${money(product.stock)}"></option>`).join("");
   const q=$("#incomingSearch").value.toLowerCase(), date=$("#incomingDateFilter").value;
   const rows=state.incoming.filter(x=>(x.product+" "+x.supplier).toLowerCase().includes(q)&&(!date||x.date===date));
-  const qty=rows.reduce((s,x)=>s+Number(x.qty||0),0), total=rows.reduce((s,x)=>s+Number(x.total||0),0);
-  $("#incomingSummary").innerHTML=`<article><div><small>Total Record</small><strong>${rows.length}</strong><p>Catatan barang masuk</p></div></article><article class="green"><div><small>Total Jumlah</small><strong>${money(qty)}</strong><p>Jumlah seluruh item</p></div></article><article class="purple"><div><small>Total Nilai</small><strong>${rupiah(total)}</strong><p>Nilai seluruh pembelian</p></div></article><article class="orange"><div><small>Rata-rata per Record</small><strong>${rupiah(rows.length?total/rows.length:0)}</strong><p>Rata-rata nilai pembelian</p></div></article>`;
+  const recordCount=persistenceMode==="legacy"?rows.length:normalizedIncomingMeta.total,qty=persistenceMode==="legacy"?rows.reduce((s,x)=>s+Number(x.qty||0),0):Number(normalizedIncomingMeta.summary?.qty||0),total=persistenceMode==="legacy"?rows.reduce((s,x)=>s+Number(x.total||0),0):Number(normalizedIncomingMeta.summary?.total||0);
+  $("#incomingSummary").innerHTML=`<article><div><small>Total Record</small><strong>${recordCount}</strong><p>Catatan barang masuk</p></div></article><article class="green"><div><small>Total Jumlah</small><strong>${money(qty)}</strong><p>Jumlah seluruh item</p></div></article><article class="purple"><div><small>Total Nilai</small><strong>${rupiah(total)}</strong><p>Nilai seluruh pembelian</p></div></article><article class="orange"><div><small>Rata-rata per Record</small><strong>${rupiah(recordCount?total/recordCount:0)}</strong><p>Rata-rata nilai pembelian</p></div></article>`;
   $("#incomingTableBody").innerHTML=rows.length?rows.map(x=>`<tr><td>${esc(x.date)}</td><td>${esc(x.supplier)}</td><td>${esc(x.product)}</td><td>${esc(x.category)}</td><td>${esc(x.unit)}</td><td>${money(x.purchasePrice)}</td><td>${money(x.qty)}</td><td>${money(x.total)}</td><td><button class="mini-btn delete" data-incoming-delete="${x.id}">Hapus</button></td></tr>`).join(""):`<tr><td colspan="9" class="empty-table">Belum ada catatan barang masuk.</td></tr>`;
   updateIncomingSummary();
 }
@@ -788,6 +962,7 @@ function saveIncoming(form){
   if(criticalSave||!requirePermission("incoming"))return;
   const p=selectedIncomingProduct(),qty=Number($("#incomingQty").value),price=Number($("#incomingPrice").value);
   if(!p||!$("#incomingSupplier").value||!Number.isFinite(qty)||!Number.isFinite(price)||qty<=0||price<0)return toast("Data barang masuk belum lengkap atau tidak valid.");
+  if(persistenceMode!=="legacy")return normalizedOperation("/incoming","POST",{productId:p.id,qty:String(qty),purchasePrice:String(price),supplier:$("#incomingSupplier").value,date:$("#incomingDate").value,note:$("#incomingNote").value.trim()},()=>{form.reset();delete $("#incomingProduct").dataset.productId;$("#incomingDate").value=today();renderAll();toast("Barang masuk dikonfirmasi server.")});
   return saveStateAndWaitForConfirmation("incoming",id=>{
     const previousStock=p.stock,previousCostPrice=p.costPrice,resultingCostPrice=calculateWeightedAverageCost(previousStock,previousCostPrice,qty,price);
     state.incoming.unshift({id:nextId("BM"),saveOperationId:id,date:$("#incomingDate").value,createdAt:new Date().toISOString(),supplier:$("#incomingSupplier").value,product:p.name,productId:p.id,category:p.category,unit:p.unit,purchasePrice:price,qty,total:price*qty,previousStock,previousCostPrice,resultingCostPrice,note:$("#incomingNote").value.trim()});
@@ -824,6 +999,7 @@ function saveQuantityEdit(){
   if(criticalSave||!requirePermission("transactions-edit"))return;
   const t=state.transactions.find(record=>record.invoice===$("#quantityInvoice").value);if(!t)return;
   const quantities=$$("[data-edit-qty]").map(input=>Number(input.value));
+  if(persistenceMode!=="legacy")return normalizedOperation(`/transactions/${encodeURIComponent(t.id)}/items`,"PATCH",{quantities:quantities.map(String),revision:t.revision},()=>{closeModal();renderAll();toast("Perubahan quantity dikonfirmasi server.")});
   return saveStateAndWaitForConfirmation("quantity",id=>applyQuantityEdit(t,quantities,id),()=>{closeModal();renderAll();toast("Perubahan quantity dikonfirmasi server.")});
 }
 
@@ -911,6 +1087,11 @@ function saveTransaction(action="save"){
   if(t.discountAmount>t.subtotal)return toast("Diskon tidak boleh melebihi subtotal.");
   if(paymentMethod==="Tunai"&&t.payment<t.total)return toast("Uang tunai kurang.");
   if(paymentMethod==="DP"&&t.downPayment<=0)return toast("Jumlah DP harus lebih dari Rp0.");
+  if(persistenceMode!=="legacy")return normalizedOperation("/transactions","POST",{
+    items:cart.map(i=>({productId:i.productId,qty:String(i.qty),price:String(i.price),discount:String(i.discount||0),priceType:i.priceType})),
+    discount:$("#cashDiscount").value||"0",payment:$("#cashPayment").value||"0",paymentMethod,
+    customer:$("#cashCustomer").value.trim()||"UMUM",courier:$("#cashCourier").value.trim()
+  },result=>{const tx=normalizeTransaction(result.transaction);selectedPrintInvoice=tx.invoice;clearCashier();renderAll();toast("Transaksi dikonfirmasi server.");goPage("print");if(action==="print"||action==="pdf")printDocument("receipt",tx)});
   for(const item of cart){
     const p=productById(item.productId);
     if(!p||!Number.isFinite(item.qty)||item.qty<=0)return toast("Produk/qty tidak valid.");
@@ -918,7 +1099,7 @@ function saveTransaction(action="save"){
   }
   if(state.transactions.some(record=>record.invoice===$("#cashInvoice").value))$("#cashInvoice").value=nextInvoice();
   const tx={
-    id:nextId("TX"),invoice:$("#cashInvoice").value,createdAt:new Date().toISOString(),
+    id:nextId("TX"),invoice:$("#cashInvoice").value,createdAt:new Date().toISOString(),businessDate:today(),
     cashier:state.currentUser||state.settings.defaultCashier,courier:$("#cashCourier").value.trim(),
     customer:$("#cashCustomer").value.trim()||"UMUM",paymentMethod:$("#cashPaymentMethod").value,items:clone(cart),
     discountMethod:state.settings.discountMethod,subtotal:t.subtotal,discountPercent:t.discountPercent,discountAmount:t.discountAmount,taxPercent:t.taxPercent,
@@ -940,12 +1121,12 @@ function saveTransaction(action="save"){
 function renderTransactions(){
   fillSelect($("#transactionPaymentFilter"),state.paymentMethods,x=>x,x=>x,true,"Semua Metode Bayar");
   const q=$("#transactionSearch").value.toLowerCase(), date=$("#transactionDateFilter").value, payment=$("#transactionPaymentFilter").value;
-  const rows=state.transactions.filter(t=>(t.invoice+" "+t.customer).toLowerCase().includes(q)&&(!date||t.createdAt.slice(0,10)===date)&&(!payment||t.paymentMethod===payment));
-  const pageSize=10,pageCount=Math.max(1,Math.ceil(rows.length/pageSize));
+  const rows=state.transactions.filter(t=>(t.invoice+" "+t.customer).toLowerCase().includes(q)&&(!date||transactionBusinessDate(t)===date)&&(!payment||t.paymentMethod===payment));
+  const pageSize=10,rowCount=persistenceMode==="legacy"?rows.length:normalizedHistory.total,pageCount=persistenceMode==="legacy"?Math.max(1,Math.ceil(rows.length/pageSize)):normalizedHistory.pages;
   transactionPage=Math.min(Math.max(transactionPage,1),pageCount);
-  const start=(transactionPage-1)*pageSize,pagedRows=rows.slice(start,start+pageSize);
-  $("#transactionRecordCount").innerHTML=`Total Record: <b>${rows.length}</b>`;
-  $("#transactionPageInfo").textContent=rows.length?`Menampilkan ${start+1} sampai ${Math.min(start+pageSize,rows.length)} dari ${rows.length} data`:`Tidak ada data transaksi`;
+  const start=(transactionPage-1)*pageSize,pagedRows=persistenceMode==="legacy"?rows.slice(start,start+pageSize):rows;
+  $("#transactionRecordCount").innerHTML=`Total Record: <b>${rowCount}</b>`;
+  $("#transactionPageInfo").textContent=rowCount?`Menampilkan ${start+1} sampai ${Math.min(start+pageSize,rowCount)} dari ${rowCount} data`:`Tidak ada data transaksi`;
   $("#transactionTableBody").innerHTML=pagedRows.length?pagedRows.map(t=>`<tr class="${Number(t.remaining||0)>0?"unpaid-row":""}"><td class="transaction-number">${esc(t.invoice)}${canSettleTransaction(t)?`<br><button class="mini-btn settle" data-tx-settle="${esc(t.invoice)}">${settlementLabel(t)}</button>`:""}</td><td>${formatDateTime(t.createdAt)}</td><td>${esc(t.cashier)}</td><td>${esc(t.courier||"-")}</td><td>${esc(t.customer)}</td><td>${esc(t.paymentMethod)}</td><td>${money(t.items.reduce((s,i)=>s+i.qty,0))}</td><td>${money(t.subtotal)}</td><td>${money(t.discountPercent)}%</td><td>${money(t.discountAmount)}</td><td>${money(t.taxPercent)}%</td><td>${money(t.taxAmount)}</td><td>${money(t.total)}</td><td>${money(getTransactionPaidTotal(t))}</td><td>${money(t.change)}</td><td>${money(t.downPayment)}</td><td>${money(t.remaining)}</td><td><span class="reference-status ${t.paymentStatus==="LUNAS"?"active":"inactive"}">${esc(t.paymentStatus)}</span></td><td><div class="row-actions">${canSettleTransaction(t)?`<button class="mini-btn settle" data-tx-settle="${esc(t.invoice)}">${settlementLabel(t)}</button>`:""}<button class="mini-btn view" data-tx-view="${t.invoice}">Detail</button><button class="mini-btn print" data-tx-print="${t.invoice}">Cetak</button>${hasPermission("transactions-edit")?`<button class="mini-btn" data-tx-edit="${esc(t.invoice)}">Edit Qty</button>`:""}${hasPermission("transactions-delete")?`<button class="mini-btn delete" data-tx-delete="${t.invoice}">Hapus</button>`:""}</div></td></tr>`).join(""):`<tr><td colspan="19" class="empty-table">Transaksi tidak ditemukan.</td></tr>`;
   const visible=[];for(let p=1;p<=pageCount;p++){if(p===1||p===pageCount||Math.abs(p-transactionPage)<=1)visible.push(p)}
   let last=0;const buttons=[];for(const p of visible){if(p-last>1)buttons.push(`<span>…</span>`);buttons.push(`<button class="${p===transactionPage?"active":""}" data-tx-page="${p}">${p}</button>`);last=p}
@@ -993,6 +1174,7 @@ function saveSettlement(e){
   if(!Number.isFinite(amount)||!amount||amount>remaining)return toast("Nominal pelunasan tidak valid.");
   if(!method||!date)return toast("Metode dan tanggal pembayaran wajib diisi.");
   if(!confirm(`Simpan pembayaran ${rupiah(amount)} untuk transaksi ${invoice}?`))return;
+  if(persistenceMode!=="legacy")return normalizedOperation(`/transactions/${encodeURIComponent(t.id)}/payments`,"POST",{amount:String(amount),method,date,note:$("#settlementNote").value.trim()},()=>{closeModal();renderAll();toast("Pembayaran dikonfirmasi server.")});
   return saveStateAndWaitForConfirmation("settlement",id=>{
     t.paymentHistory=Array.isArray(t.paymentHistory)?t.paymentHistory:[];
     t.paymentHistory.push({id,date,method,amount,createdAt:new Date().toISOString(),cashier:state.currentUser||state.settings.defaultCashier,note:$("#settlementNote").value.trim()});
@@ -1000,6 +1182,7 @@ function saveSettlement(e){
   },()=>{closeModal();renderAll();toast("Pembayaran dikonfirmasi server.")});
 }
 function deleteTransaction(invoice){
+  if(persistenceMode!=="legacy")return toast("Penghapusan historis dinonaktifkan selama tahap migrasi.");
   if(!requirePermission("transactions-delete"))return;
   const t=state.transactions.find(x=>x.invoice===invoice); if(!t)return;
   if(window.__deletingTransaction)return;
@@ -1018,6 +1201,7 @@ function deleteTransaction(invoice){
   state.transactions=state.transactions.filter(x=>x.invoice!==invoice);saveState();window.__deletingTransaction=false;renderAll();toast("Transaksi dihapus dan stok dikembalikan.");
 }
 function deleteIncomingRecord(id){
+  if(persistenceMode!=="legacy")return toast("Penghapusan historis dinonaktifkan selama tahap migrasi.");
   if(window.__deletingIncoming)return;
   const record=state.incoming.find(item=>item.id===id);if(!record)return;
   if(!confirm("Hapus catatan barang masuk? Stok akan dikurangi kembali."))return;
@@ -1033,9 +1217,29 @@ function deleteIncomingRecord(id){
   state.incoming=state.incoming.filter(item=>item.id!==id);saveState();window.__deletingIncoming=false;renderAll();toast("Catatan barang masuk dihapus dan stok dikurangi.");
 }
 
-function selectedPrintTransaction(){return state.transactions.find(transaction=>transaction.invoice===selectedPrintInvoice)||state.transactions[0]}
+
+function selectedPrintTransaction(){
+  if(!selectedPrintInvoice)return null;
+  return persistenceMode!=="legacy"?(normalizedPrintTransaction?.invoice===selectedPrintInvoice?normalizedPrintTransaction:null):state.transactions.find(t=>String(t.invoice)===selectedPrintInvoice)||null;
+}
+async function fetchExactPrintInvoice(invoice){
+  const t=await apiRequest(`/transaction-by-invoice?invoice=${encodeURIComponent(invoice)}`);
+  if(!t||String(t.invoice)!==invoice||!Array.isArray(t.items))throw new Error("Respons nota tidak sesuai nomor yang dipilih. Pencetakan diblokir.");
+  return normalizeTransaction(t);
+}
+async function selectPrintInvoice(invoice){
+  selectedPrintInvoice=String(invoice||"").trim();normalizedPrintTransaction=null;printLookupError="";
+  const selected=selectedPrintInvoice,generation=sessionGeneration,sequence=++printLookupSequence;
+  if(!selected){renderPrint();return null}
+  if(persistenceMode==="legacy"){renderPrint();return selectedPrintTransaction()}
+  const work=fetchExactPrintInvoice(selected);printLookup=work;
+  $("#printPreviews").innerHTML="<p>Memuat nota yang dipilih...</p>";
+  try{const t=await work;if(generation!==sessionGeneration||sequence!==printLookupSequence||selected!==selectedPrintInvoice)return null;normalizedPrintTransaction=t;return t}
+  catch(error){if(generation===sessionGeneration&&sequence===printLookupSequence){printLookupError="Nota "+selected+" gagal dimuat. Pencetakan diblokir: "+error.message;toast(printLookupError)}return null}
+  finally{if(printLookup===work)printLookup=null;if(generation===sessionGeneration&&sequence===printLookupSequence)renderPrint()}
+}
 function receiptDateParts(value){
-  try{const date=new Date(value);return {date:new Intl.DateTimeFormat("id-ID",{day:"2-digit",month:"2-digit",year:"2-digit"}).format(date),time:new Intl.DateTimeFormat("id-ID",{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}).format(date)}}
+  try{const date=new Date(value);return {date:new Intl.DateTimeFormat("id-ID",{day:"2-digit",month:"2-digit",year:"2-digit",timeZone:BUSINESS_TIME_ZONE}).format(date),time:new Intl.DateTimeFormat("id-ID",{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false,timeZone:BUSINESS_TIME_ZONE}).format(date)}}
   catch{return {date:String(value||"-"),time:"-"}}
 }
 // Shared display rows keep transaction detail, receipt and A4 payment information aligned.
@@ -1076,8 +1280,12 @@ function printContent(type,transaction,settings){return type==="receipt"?renderR
 function renderPrint(){
   const settings=state.settings,transaction=selectedPrintTransaction();
   $("#printReceiptType").value=settings.receiptType;$("#printMethod").value=settings.printMethod;
-  if(!transaction){$("#printPreviews").innerHTML="<p>Belum ada transaksi.</p>";return}
-  selectedPrintInvoice=transaction.invoice;$("#printInvoiceSearch").value=transaction.invoice;
+  if(!transaction){
+    $("#printPreviews").innerHTML=`<p>${esc(printLookupError||(selectedPrintInvoice?"Nota yang dipilih belum tersedia. Pencetakan diblokir.":"Pilih nomor nota yang akan dicetak."))}</p>`;
+    if(persistenceMode!=="legacy"&&selectedPrintInvoice&&!printLookup&&!printLookupError)selectPrintInvoice(selectedPrintInvoice);
+    return;
+  }
+  $("#printInvoiceSearch").value=transaction.invoice;
   $("#printPreviews").innerHTML=[['receipt','Struk 58 mm'],['invoice','Invoice A4'],['faktur','Faktur A4']].map(([type,label])=>`<section class="print-preview-card ${type==='receipt'?'receipt-preview':''}"><header><b>Preview ${label}</b><button class="button blue preview-print-button" data-print-document="${type}" type="button">Cetak ${label}</button></header><div class="preview-canvas"><iframe title="Preview ${label}" class="document-preview ${type==='receipt'?'receipt-frame':'a4-frame'}" srcdoc="${esc(printFrameHtml(type,transaction))}"></iframe></div></section>`).join("");
 }
 function receiptPrintCss(){return `@page{size:58mm auto;margin:0}*{box-sizing:border-box;max-width:100%}html,body{width:58mm;margin:0;padding:0;background:#fff;color:#000;-webkit-print-color-adjust:exact;print-color-adjust:exact}body.print-receipt{width:58mm}${receiptCss(".receipt-paper")}@media print{html,body{width:58mm;margin:0;padding:0;background:#fff}.receipt-paper{width:54mm;max-width:54mm;margin:0 auto;padding:1.5mm .5mm 2mm;box-shadow:none;border:0}}`}
@@ -1099,16 +1307,27 @@ async function waitForPrintFrame(frame,type){
     await new Promise(resolve=>requestAnimationFrame(resolve));
   }
 }
-async function printDocument(type,transaction=selectedPrintTransaction()){
+async function printDocument(type,transaction){
   if(!["receipt","invoice","faktur"].includes(type))return toast("Jenis dokumen cetak tidak valid.");
-  if(!transaction)return toast("Pilih transaksi yang akan dicetak terlebih dahulu.");
   if(isPrinting)return toast("Dialog cetak sedang dibuka.");
+  const invoice=selectedPrintInvoice,generation=sessionGeneration,sequence=printLookupSequence;
+  if(!invoice)return toast("Pilih nomor nota yang akan dicetak terlebih dahulu.");
+  if(transaction&&String(transaction.invoice)!==invoice)return toast("Nomor nota tidak sesuai pilihan. Pencetakan diblokir.");
+  const stillSelected=()=>generation===sessionGeneration&&invoice===selectedPrintInvoice&&sequence===printLookupSequence;
+  isPrinting=true;setPrintButtonsDisabled(true);
+  try{
+    transaction=persistenceMode!=="legacy"?await fetchExactPrintInvoice(invoice):(transaction||selectedPrintTransaction());
+    if(!stillSelected())throw new Error("Pilihan nota atau sesi berubah. Cetak kembali nota yang dipilih.");
+    if(!transaction||String(transaction.invoice)!==invoice)throw new Error("Nota yang dipilih tidak ditemukan. Pencetakan diblokir.");
+    if(persistenceMode!=="legacy")normalizedPrintTransaction=transaction;
+  }catch(error){isPrinting=false;setPrintButtonsDisabled(false);if(generation===sessionGeneration){if(stillSelected()){normalizedPrintTransaction=null;printLookupError=error.message;$("#printPreviews").innerHTML=`<p>${esc(error.message)}</p>`}toast(error.message)}return}
   isPrinting=true;setPrintButtonsDisabled(true);activePrintFrame?.remove();
   const frame=document.createElement("iframe");activePrintFrame=frame;frame.setAttribute("aria-hidden","true");frame.style.cssText=`position:fixed;left:-10000px;top:0;width:${type==="receipt"?"58mm":"210mm"};height:2000px;border:0;opacity:0;pointer-events:none;background:#fff`;document.body.appendChild(frame);
   let cleaned=false;const cleanup=()=>{if(cleaned)return;cleaned=true;if(activePrintFrame===frame){activePrintFrame=null;frame.remove()}isPrinting=false;setPrintButtonsDisabled(false)};
   try{
     const printDoc=frame.contentDocument;printDoc.open();printDoc.write(printFrameHtml(type,transaction));printDoc.close();
     await waitForPrintFrame(frame,type);
+    if(!stillSelected()){cleanup();toast("Pilihan nota atau sesi berubah. Pencetakan dibatalkan.");return}
     const printWindow=frame.contentWindow;printWindow.addEventListener("afterprint",cleanup,{once:true});printWindow.focus();printWindow.print();setTimeout(cleanup,1000);
   }catch(error){cleanup();toast("Dokumen cetak gagal disiapkan.");console.error(error)}
 }
@@ -1121,8 +1340,9 @@ function printSelected(){
 function renderStocktake(){
   fillSelect($("#stockProduct"),state.products,x=>x.id,x=>x.name,true,"-- Produk --");
   const q=$("#stockSearch").value.toLowerCase(),date=$("#stockDateFilter").value,rows=state.stocktakes.filter(x=>(x.product+" "+x.category).toLowerCase().includes(q)&&(!date||x.date===date));
-  const positive=rows.filter(x=>x.difference>0).reduce((s,x)=>s+x.difference,0),negative=rows.filter(x=>x.difference<0).reduce((s,x)=>s+x.difference,0),difference=rows.reduce((s,x)=>s+x.difference,0);
-  $("#stocktakeSummary").innerHTML=`<article><div><small>Total Record</small><strong>${rows.length}</strong><p>Catatan stok opname</p></div></article><article class="green"><div><small>Total Selisih Lebih</small><strong>${money(positive)}</strong><p>Stok fisik lebih banyak</p></div></article><article class="orange"><div><small>Total Selisih Kurang</small><strong>${money(negative)}</strong><p>Stok fisik lebih sedikit</p></div></article><article class="purple"><div><small>Selisih Bersih</small><strong>${money(difference)}</strong><p>Total seluruh selisih</p></div></article>`;
+  const summary=persistenceMode!=="legacy"?normalizedStockMeta.summary:null;
+  const positive=summary?Number(summary.positive):rows.filter(x=>x.difference>0).reduce((s,x)=>s+x.difference,0),negative=summary?Number(summary.negative):rows.filter(x=>x.difference<0).reduce((s,x)=>s+x.difference,0),difference=summary?Number(summary.difference):rows.reduce((s,x)=>s+x.difference,0);
+  $("#stocktakeSummary").innerHTML=`<article><div><small>Total Record</small><strong>${persistenceMode==="legacy"?rows.length:normalizedStockMeta.total}</strong><p>Catatan stok opname</p></div></article><article class="green"><div><small>Total Selisih Lebih</small><strong>${money(positive)}</strong><p>Stok fisik lebih banyak</p></div></article><article class="orange"><div><small>Total Selisih Kurang</small><strong>${money(negative)}</strong><p>Stok fisik lebih sedikit</p></div></article><article class="purple"><div><small>Selisih Bersih</small><strong>${money(difference)}</strong><p>Total seluruh selisih</p></div></article>`;
   $("#stocktakeTableBody").innerHTML=rows.length?rows.map(x=>`<tr><td>${esc(x.date)}</td><td>${esc(x.product)}</td><td>${esc(x.category)}</td><td>${esc(x.unit)}</td><td>${money(x.systemStock)}</td><td>${money(x.physicalStock)}</td><td class="${x.difference<0?"negative":"positive"}">${money(x.difference)}</td><td>${esc(x.note||"-")}</td><td><button class="mini-btn delete" data-stocktake-delete="${x.id}">Hapus</button></td></tr>`).join(""):`<tr><td colspan="9" class="empty-table">Data stok opname tidak ditemukan.</td></tr>`;
   updateStockSummary();
 }
@@ -1142,6 +1362,11 @@ function renderAll(){
   renderIncoming(); renderCashier(); renderTransactions(); renderPrint(); renderStocktake();
   drafts.forEach(([el,value])=>{if(el.tagName==="SELECT"&&value&&![...el.options].some(option=>option.value===value))el.add(new Option(value,value));el.value=value});
   renderCart();updateIncomingSummary();
+  if(persistenceMode!=="legacy")for(const [kind,selector,page,meta] of [["incoming","#incomingList",normalizedIncomingPage,normalizedIncomingMeta],["stock","#stockList",normalizedStockPage,normalizedStockMeta]]){
+    const host=$(selector);if(!host)continue;let pager=host.querySelector(".normalized-pagination");
+    if(!pager){pager=document.createElement("div");pager.className="normalized-pagination";host.appendChild(pager)}
+    pager.innerHTML=`<button data-kind="${kind}" data-normalized-page="${page-1}" ${page<=1?"disabled":""}>‹</button> Halaman ${page} / ${meta.pages} · ${meta.total} record <button data-kind="${kind}" data-normalized-page="${page+1}" ${page>=meta.pages?"disabled":""}>›</button>`;
+  }
 }
 
 document.addEventListener("submit",async e=>{
@@ -1149,6 +1374,7 @@ document.addEventListener("submit",async e=>{
   if(e.target.id==="loginForm"){e.preventDefault();login($("#loginUsername").value,$("#loginPassword").value)}
   if(e.target.id==="settingsForm")saveSettings(e);
   if(e.target.id==="referenceForm"){e.preventDefault();if(!requirePermission("references"))return;const name=$("#referenceName").value.trim(),index=$("#referenceIndex").value;
+    if(persistenceMode!=="legacy"){const data={settings:state.settings,categories:clone(state.categories),units:clone(state.units),paymentMethods:clone(state.paymentMethods)},key=activeReference==="categories"?"categories":activeReference==="units"?"units":"paymentMethods";if(index==="")data[key].push(name);else data[key][Number(index)]=name;return normalizedOperation("/configuration","PUT",{revision:serverStateVersion,data},()=>{closeModal();renderAll();toast("Referensi dikonfirmasi server.")})}
     const list=activeReference==="categories"?state.categories:activeReference==="units"?state.units:state.paymentMethods;
     if(index==="")list.push(name);else list[Number(index)]=name;saveState();closeModal();renderAll();toast("Referensi disimpan.");
   }
@@ -1156,15 +1382,18 @@ document.addEventListener("submit",async e=>{
     try{if(id){await apiRequest(`/users/${id}`,{method:"PUT",body:JSON.stringify(data)});if(password)await apiRequest(`/users/${id}/password`,{method:"PUT",body:JSON.stringify({password})})}else await apiRequest("/users",{method:"POST",body:JSON.stringify({...data,password})});closeModal();if(id===sessionUser?.id&&password){logout();toast("Password berhasil diubah. Silakan login kembali.");return}await loadUsers();toast("Pengguna disimpan.")}catch(error){toast(error.message)}
   }
   if(e.target.id==="productForm"){e.preventDefault();if(!requirePermission("products-manage"))return;const id=$("#productId").value,quickAdd=quickAddTarget==="product"&&!id;const p={id:id||nextId("P",state.products),name:$("#productName").value.trim(),category:$("#productCategory").value,unit:$("#productUnit").value,trackStock:$("#productTrack").value==="true",active:$("#productActive").value==="true",costPrice:Number($("#productCost").value||0),retailPrice:Number($("#productRetail").value||0),wholesalePrice:Number($("#productWholesale").value||0),discount:Number($("#productDiscount").value||0),stock:Number($("#productStock").value||0),minStock:Number($("#productMinStock").value||0)};
+    if(persistenceMode!=="legacy")return normalizedOperation("/products","POST",{data:p,revision:serverStateVersion},()=>{if(id)state.products[state.products.findIndex(x=>x.id===id)]=p;else state.products.push(p);closeModal();renderAll();if(quickAdd){$("#cashProduct").value=p.name;updateCashProduct()}toast("Produk dikonfirmasi server.")});
     if(id)state.products[state.products.findIndex(x=>x.id===id)]=p;else state.products.push(p);saveState();closeModal();renderAll();if(quickAdd){$("#cashProduct").value=p.name;updateCashProduct()}toast("Produk disimpan.");
   }
   if(e.target.id==="contactForm"){e.preventDefault();const type=$("#contactType").value;if(!requirePermission(type==="supplier"?"suppliers":"customers"))return;const list=type==="supplier"?state.suppliers:state.customers,id=$("#contactId").value,quickAdd=quickAddTarget==="customer"&&type==="customer"&&!id;
     const x={id:id||nextId(type==="supplier"?"S":"C",list),name:$("#contactName").value.trim(),address:$("#contactAddress").value.trim(),phone:$("#contactPhone").value.trim(),email:$("#contactEmail").value.trim(),note:$("#contactNote").value.trim()};
+    if(persistenceMode!=="legacy")return normalizedOperation(type==="supplier"?"/suppliers":"/customers","POST",{data:x,revision:serverStateVersion},()=>{if(id)list[list.findIndex(a=>a.id===id)]=x;else list.push(x);closeModal();renderAll();if(quickAdd)$("#cashCustomer").value=x.name;toast("Data dikonfirmasi server.")});
     if(id)list[list.findIndex(a=>a.id===id)]=x;else list.push(x);saveState();closeModal();renderAll();if(quickAdd)$("#cashCustomer").value=x.name;toast("Data disimpan.");
   }
   if(e.target.id==="incomingForm"){e.preventDefault();saveIncoming(e.target)}
   if(e.target.id==="quantityEditForm"){e.preventDefault();saveQuantityEdit()}
   if(e.target.id==="stocktakeForm"){e.preventDefault();if(!requirePermission("stocktake"))return;const p=productById($("#stockProduct").value),physical=Number($("#stockPhysical").value||0);if(!p||physical<0)return toast("Data stok opname tidak valid.");
+    if(persistenceMode!=="legacy")return normalizedOperation("/stocktakes","POST",{productId:p.id,physicalStock:String(physical),expectedStock:$("#stockSystem").value,date:$("#stockDate").value,note:$("#stockNote").value.trim()},()=>{e.target.reset();$("#stockDate").value=today();renderAll();toast("Stok opname dikonfirmasi server.")});
     const old=p.stock,diff=physical-old;state.stocktakes.unshift({id:nextId("OP",state.stocktakes),date:$("#stockDate").value,product:p.name,productId:p.id,category:p.category,unit:p.unit,systemStock:old,physicalStock:physical,difference:diff,note:$("#stockNote").value.trim()});p.stock=physical;saveState();e.target.reset();$("#stockDate").value=today();renderAll();toast("Stok opname disimpan.");
   }
   if(e.target.id==="settlementForm")saveSettlement(e);
@@ -1172,6 +1401,9 @@ document.addEventListener("submit",async e=>{
 });
 
 document.addEventListener("click",async e=>{
+  if(blockUnavailableNormalizedAction(e.target)){e.preventDefault();return}
+  const normalizedPager=e.target.closest("[data-normalized-page]");
+  if(normalizedPager&&!normalizedPager.disabled){if(normalizedPager.dataset.kind==="incoming")normalizedIncomingPage=Number(normalizedPager.dataset.normalizedPage);else normalizedStockPage=Number(normalizedPager.dataset.normalizedPage);reloadNormalizedPage();return}
   if(e.target.closest("#logoutBtn,#retryLogoutBtn")){logout();return}
   if(e.target.closest("#retrySaveBtn")){retryCriticalSave();return}
   if(criticalSave)return;
@@ -1210,13 +1442,13 @@ document.addEventListener("click",async e=>{
   if(e.target.id==="saveTransactionBtn")saveTransaction();
   if(e.target.id==="printCashierReceiptBtn")saveTransaction("print");
   if(e.target.id==="saveCashierPdfBtn")saveTransaction("pdf");
-  if(e.target.id==="findPrintInvoiceBtn"){const v=$("#printInvoiceSearch").value.trim();if(!state.transactions.some(t=>t.invoice===v))return toast("Nomor transaksi tidak ditemukan.");selectedPrintInvoice=v;renderPrint();}
+  if(e.target.id==="findPrintInvoiceBtn"){await selectPrintInvoice($("#printInvoiceSearch").value);renderPrint();return}
   if(e.target.id==="printSelectedBtn")printSelected();
   const printButton=e.target.closest("[data-print-document]");if(printButton)printDocument(printButton.dataset.printDocument);
   if(e.target.id==="backupDataBtn")backupData();
   if(e.target.id==="restoreDataBtn"&&requirePermission("backup"))$("#restoreDataInput")?.click();
-  if(e.target.id==="refreshTransactionsBtn"){transactionPage=1;renderTransactions();}
-  const txPage=e.target.closest("[data-tx-page]");if(txPage&&!txPage.disabled){transactionPage=Number(txPage.dataset.txPage);renderTransactions();}
+  if(e.target.id==="refreshTransactionsBtn"){transactionPage=1;if(persistenceMode!=="legacy")reloadNormalizedPage();else renderTransactions();}
+  const txPage=e.target.closest("[data-tx-page]");if(txPage&&!txPage.disabled){transactionPage=Number(txPage.dataset.txPage);if(persistenceMode!=="legacy")reloadNormalizedPage();else renderTransactions();}
   if(e.target.id==="resetAppBtn"&&requirePermission("settings")&&confirm("Semua data aplikasi akan dikembalikan ke data awal. Lanjutkan?")){state=clone(window.SEED_DATA);saveState();location.reload();}
   const ref=e.target.closest("[data-ref]");if(ref&&requirePermission("references")){activeReference=ref.dataset.ref;renderReferences()}
   const refEdit=e.target.closest("[data-ref-edit]");if(refEdit&&requirePermission("references"))referenceModal(Number(refEdit.dataset.refEdit));
@@ -1238,7 +1470,7 @@ document.addEventListener("click",async e=>{
   const edit=e.target.closest("[data-tx-edit]");if(edit)quantityEditModal(edit.dataset.txEdit);
   const suggestion=e.target.closest("[data-incoming-product]");if(suggestion){const p=productById(suggestion.dataset.incomingProduct);if(p){$("#incomingProduct").value=p.name;$("#incomingProduct").dataset.productId=p.id;updateIncomingProduct();$("#incomingSuggestions").hidden=true}}
   const tv=e.target.closest("[data-tx-view]");if(tv)transactionDetail(state.transactions.find(x=>x.invoice===tv.dataset.txView));
-  const tp=e.target.closest("[data-tx-print]");if(tp){selectedPrintInvoice=tp.dataset.txPrint;goPage("print")}
+  const tp=e.target.closest("[data-tx-print]");if(tp){await selectPrintInvoice(tp.dataset.txPrint);goPage("print")}
   const td=e.target.closest("[data-tx-delete]");if(td)deleteTransaction(td.dataset.txDelete);
   const st=e.target.closest("[data-stocktake-delete]");if(st&&requirePermission("stocktake")&&confirm("Hapus riwayat stok opname? Stok saat ini tidak diubah.")){state.stocktakes=state.stocktakes.filter(x=>x.id!==st.dataset.stocktakeDelete);saveState();renderAll();}
   const it=e.target.closest("[data-incoming-tab]");if(it){$$("[data-incoming-tab]").forEach(b=>b.classList.toggle("active",b===it));$("#incomingInput").classList.toggle("hidden",it.dataset.incomingTab!=="input");$("#incomingList").classList.toggle("hidden",it.dataset.incomingTab!=="list");}
@@ -1255,6 +1487,7 @@ document.addEventListener("keydown",e=>{
   }
 });
 document.addEventListener("input",e=>{
+  if(persistenceMode!=="legacy"&&["transactionSearch","transactionDateFilter","incomingSearch","incomingDateFilter","stockSearch","stockDateFilter"].includes(e.target.id)){transactionPage=1;normalizedIncomingPage=1;normalizedStockPage=1;clearTimeout(normalizedQueryTimer);normalizedQueryTimer=setTimeout(()=>reloadNormalizedPage(),350);return}
   if(["productSearch","supplierSearch","customerSearch","incomingSearch","incomingDateFilter","stockSearch","stockDateFilter","transactionSearch","transactionDateFilter"].includes(e.target.id)){if(e.target.id.startsWith("transaction"))transactionPage=1;if(e.target.id==="productSearch")productPage=1;if(e.target.id==="customerSearch")customerPage=1;renderAll();}
   if(e.target.id==="incomingProduct"&&!e.isComposing){updateIncomingProduct();renderIncomingSuggestions()}
   if(["incomingPrice","incomingQty"].includes(e.target.id))updateIncomingTotal();
@@ -1277,6 +1510,8 @@ document.addEventListener("reset",e=>{
   if(e.target.id==="stocktakeForm")setTimeout(()=>{if(generation!==sessionGeneration)return;$("#stockDate").value=today();updateStockSummary();},0);
 });
 document.addEventListener("change",e=>{
+  if(persistenceMode!=="legacy"&&["transactionPaymentFilter","dashboardDate"].includes(e.target.id)){transactionPage=1;reloadNormalizedPage();return}
+  if(["printReceiptType","printMethod"].includes(e.target.id)){savePrintPreference(e.target.id,e.target.value);return}
   if(e.target.id==="incomingProduct")updateIncomingProduct();
   if(e.target.id==="incomingSupplier")updateIncomingSummary();
   if(e.target.id==="cashProduct"||e.target.id==="cashPriceType")updateCashProduct();

@@ -62,6 +62,12 @@ async function run(){
   loaded=await invoke('/api/state','ADMINISTRATOR',undefined,'GET');assert.equal(loaded.body.state.incoming.length,1);assert.equal(loaded.body.state.products[0].stock,13);
   assert.equal((await invoke('/api/state','ADMINISTRATOR',{state:submitted,expectedVersion:oldVersion})).status,409);
   assert.equal(state.incoming.length,1);assert.equal(state.products[0].stock,13);
+  for(const [i,[price,discount,ok]] of [[1,0,true],[0,0,true],[10,10,true],[99,0,true],[-1,0,false],[10,-1,false],[10,11,false],['Infinity',0,false],['NaN',0,false]].entries()){
+    const beforeVersion=version,beforeStock=state.products[0].stock;
+    const candidate=structuredClone(state);candidate.transactions.push({id:'policy-'+i,invoice:'policy-'+i,paymentMethod:'Tunai',total:Math.max(Number(price)-discount,0),payment:100,items:[{productId:'p',qty:1,price,discount}]});
+    assert.equal((await invoke('/api/state','KASIR',{state:candidate,expectedVersion:version})).status,ok?200:400);
+    assert.equal(version,beforeVersion+(ok?1:0));assert.equal(state.products[0].stock,beforeStock-(ok?1:0));
+  }
   console.log('Business API: password roles/routes, persistence, stock, CAS conflicts and duplicate payments passed (stub database).');
 }
 run().catch(error=>{console.error(error);process.exitCode=1});

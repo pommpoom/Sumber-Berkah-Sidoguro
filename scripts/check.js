@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 
 const root = path.resolve(__dirname, '..');
+for (const directory of ['server','scripts']) for (const file of fs.readdirSync(path.join(root,directory)).filter(x=>x.endsWith('.js'))) execFileSync(process.execPath,['--check',path.join(root,directory,file)],{stdio:'inherit'});
 for (const file of ['assets/js/app.js', 'assets/js/page-loader.js', 'api/index.js', 'netlify/functions/api.js', 'server/app.js', 'server/index.js', 'scripts/build.js', 'scripts/realtime-client.js', 'scripts/netlify-test.js', 'scripts/state-refresh-test.js', 'scripts/critical-save-test.js', 'scripts/business-api-test.js']) {
   execFileSync(process.execPath, ['--check', path.join(root, file)], { stdio: 'inherit' });
 }

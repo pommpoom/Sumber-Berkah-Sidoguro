@@ -7,6 +7,7 @@ const { rateLimit } = require('express-rate-limit');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { createClient } = require('@supabase/supabase-js');
+const normalized = require('./normalized');
 
 const app = express();
 const USER_FIELDS = 'id, username, role, active, created_at, updated_at';
@@ -95,7 +96,7 @@ async function requireAuth(req, res, next) {
 }
 
 const requireAdmin = (req, res, next) => req.user.role === 'ADMINISTRATOR' ? next() : res.status(403).json({ message: 'Anda tidak memiliki izin untuk melakukan tindakan ini.' });
-const publicUser = user => ({ id: user.id, username: user.username, level: user.role, active: user.active });
+const publicUser = user => ({ id: user.id, username: user.username, level: user.role, active: user.active, persistenceMode: normalized.mode() });
 const sessionCookieOptions = req => ({
   httpOnly: true,
   secure: getRuntime().production && !/^(localhost|127\.0\.0\.1)$/i.test(req.hostname || ''),
@@ -207,8 +208,11 @@ function mergeCashierState(current, submitted, currentUserName) {
     const items = (transaction.items || []).map(item => {
       const product = oldProducts.get(item.productId);
       if (!product || !Number.isFinite(item.qty) || item.qty <= 0) throw Object.assign(new Error('Produk/qty tidak valid.'), { status: 400 });
+      // Preserve cashier overrides/free/below-cost sales, but enforce the UI's numeric bounds.
+      const price = Number(item.price ?? 0), discount = Number(item.discount ?? 0);
+      if (!Number.isFinite(price) || !Number.isFinite(discount) || price < 0 || discount < 0 || discount > price) throw Object.assign(new Error('Harga/diskon item tidak valid.'), { status: 400 });
       const costPrice = Number(product?.costPrice || 0);
-      return { ...item, costPrice, profit: (Number(item.price || 0) - Number(item.discount || 0) - costPrice) * Number(item.qty || 0) };
+      return { ...item, price, discount, costPrice, profit: (price - discount - costPrice) * item.qty };
     });
     return { ...transaction, cashier: currentUserName, items };
   });
@@ -301,6 +305,7 @@ app.get('/api/state/version', requireAuth, stateReadLimiter, async (_req, res, n
 
 app.get('/api/state', requireAuth, ensureReady, stateReadLimiter, async (req, res, next) => {
   try {
+    if (normalized.mode() !== 'legacy') return res.status(409).json({ message: 'Reload the application: normalized persistence is active.' });
     const { data, error } = await getRuntime().supabase.from('app_state').select('payload, version, updated_at').eq('id', 1).maybeSingle();
     if (error) throw error;
     const payload = withoutSensitiveFields(data?.payload || {});
@@ -310,6 +315,7 @@ app.get('/api/state', requireAuth, ensureReady, stateReadLimiter, async (req, re
 
 app.put('/api/state', requireJson, rejectOversizedBody(STATE_JSON_LIMIT), requireAuth, ensureReady, stateWriteLimiter, parseStateJson, async (req, res, next) => {
   try {
+    if (normalized.mode() !== 'legacy') return res.status(409).json({ message: 'Legacy writes are disabled. Reload the application.' });
     let payload = req.body?.state;
     const expectedVersion = Number(req.body?.expectedVersion);
     if (!validState(payload) || hasSensitiveKey(payload)) return res.status(400).json({ message: 'Struktur data tidak valid atau mengandung field sensitif.' });
@@ -405,6 +411,7 @@ app.put('/api/users/me/password', requireJson, rejectOversizedBody(SMALL_JSON_LI
 
 app.put('/api/users/:id/password', requireJson, rejectOversizedBody(SMALL_JSON_LIMIT), requireAuth, ensureReady, requireAdmin, userWriteLimiter, parseSmallJson, async (req, res, next) => { try { await updatePassword(req.params.id, req.body?.password); res.json({ ok: true }); } catch (error) { next(error); } });
 
+normalized.install(app, { requireAuth, requireAdmin, getRuntime, requireJson, jsonParser, rejectOversizedBody, stateReadLimiter, stateWriteLimiter });
 app.use('/api', (_req, res) => res.status(404).json({ message: 'Endpoint tidak ditemukan.' }));
 app.use((error, _req, res, _next) => {
   console.error('API error:', error.message, error.cause?.message || '');
