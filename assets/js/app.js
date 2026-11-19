@@ -569,9 +569,58 @@ function calculateWeightedAverageCost(currentStock,currentCost,incomingQty,incom
   return newStock?(oldStock*oldCost+addedStock*addedCost)/newStock:0;
 }
 function csvDownload(filename,headers,rows){
-  const data=[headers,...rows].map(r=>r.map(v=>`"${String(v??"").replaceAll('"','""')}"`).join(",")).join("\n");
+  // Spreadsheet formula injection: neutralize untrusted text (not numeric values).
+  const cell=v=>{
+    const raw=String(v??"");
+    const safe=(typeof v==="string"&&/^[\s\uFEFF]*[=+@-]/.test(raw)&&!/^[-+]?\d+(?:\.\d+)?$/.test(raw.trim()))?"'"+raw:raw;
+    return `"${safe.replaceAll('"','""')}"`;
+  };
+  const data=[headers,...rows].map(r=>r.map(cell).join(",")).join("\n");
   const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob(["\ufeff"+data],{type:"text/csv"}));
   a.download=filename; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),500);
+}
+// Export the *entire* normalized history, never the currently displayed page.
+// Every page is read at the same server revision, and the revision is checked
+// once more before a download can start. A changed snapshot produces NO CSV.
+let completeExportInFlight=false;
+async function exportCompleteNormalizedHistory(kind){
+  if(!requirePermission("backup"))return;
+  if(persistenceMode==="legacy")return toast("Gunakan ekspor legacy pada halaman ini.");
+  if(!["transactions","incoming"].includes(kind))return;
+  if(completeExportInFlight||criticalSave)return toast("Selesaikan proses yang sedang berjalan terlebih dahulu.");
+  if(!Number.isSafeInteger(serverStateVersion))return toast("Revisi data belum tersedia. Refresh dahulu.");
+  const generation=sessionGeneration,revision=serverStateVersion,rows=[];
+  completeExportInFlight=true;
+  try{
+    let total=null;
+    for(let page=1;page<=500;page++){
+      const query=new URLSearchParams({page:String(page),limit:"100",expectedRevision:String(revision)});
+      const result=await apiRequest(`/${kind}?${query}`);
+      if(generation!==sessionGeneration||!apiToken)throw new Error("Sesi berubah. Ekspor dibatalkan.");
+      if(!result||!Number.isSafeInteger(result.total)||result.total<0||!Array.isArray(result.rows))throw new Error("Respons ekspor tidak valid.");
+      if(total===null){total=result.total;if(total>50000)throw new Error("Riwayat terlalu besar untuk ekspor browser. Gunakan ekspor operator.");}
+      if(result.total!==total)throw new Error("Jumlah record berubah. Ulangi ekspor.");
+      const expected=Math.max(0,Math.min(100,total-rows.length));
+      if(result.rows.length!==expected)throw new Error("Halaman ekspor tidak lengkap. Tidak ada file yang dibuat.");
+      rows.push(...result.rows);
+      if(rows.length===total)break;
+    }
+    if(total===null||rows.length!==total)throw new Error("Ekspor belum mencakup seluruh riwayat.");
+    const sync=await apiRequest("/sync");
+    if(sync.version!==revision||generation!==sessionGeneration||!apiToken)
+      throw new Error("Data atau sesi berubah saat ekspor. Tidak ada file dibuat.");
+    if(kind==="transactions"){
+      csvDownload(`transaksi-keluar-lengkap-${today()}.csv`,
+        ["No Transaksi","Tanggal","Kasir","Pelanggan","Metode","Subtotal","Diskon","Pajak","Total","Total Dibayar","Kembali","DP","Sisa","Status"],
+        rows.map(x=>[x.invoice,x.createdAt,x.cashier,x.customer,x.paymentMethod,x.subtotal,x.discountAmount,x.taxAmount,x.total,getTransactionPaidTotal(x),x.change,x.downPayment,x.remaining,x.paymentStatus]));
+    }else{
+      csvDownload(`barang-masuk-lengkap-${today()}.csv`,
+        ["Tanggal","Supplier","Produk","Kategori","Satuan","Harga Beli","Jumlah","Total"],
+        rows.map(x=>[x.date,x.supplier,x.product,x.category,x.unit,x.purchasePrice,x.qty,x.total]));
+    }
+    toast(`Ekspor selesai: ${rows.length} record dari revisi ${revision}.`);
+  }catch(error){toast("Ekspor dibatalkan: "+(error.message||"Gagal membaca seluruh riwayat."));}
+  finally{completeExportInFlight=false;}
 }
 function backupData(){
   if(persistenceMode!=="legacy")return toast("Backup lengkap memerlukan ekspor database melalui prosedur migrasi; halaman ini hanya memuat sebagian riwayat.");
@@ -776,7 +825,7 @@ function savePrintPreference(id,value){
   const settings={...clone(state.settings),[key]:value};
   return normalizedOperation("/configuration","PUT",{revision:serverStateVersion,data:{settings,categories:clone(state.categories),units:clone(state.units),paymentMethods:clone(state.paymentMethods)}},()=>{renderPrint();toast("Preferensi cetak dikonfirmasi server.")});
 }
-const NORMALIZED_UNAVAILABLE_ACTIONS="[data-tx-delete],[data-incoming-delete],[data-product-delete],[data-supplier-delete],[data-customer-delete],[data-stocktake-delete],[data-ref-delete],#resetAppBtn,#restoreDataBtn,#backupDataBtn,#exportIncomingBtn,#exportTransactionsBtn";
+const NORMALIZED_UNAVAILABLE_ACTIONS="[data-tx-delete],[data-incoming-delete],[data-product-delete],[data-supplier-delete],[data-customer-delete],[data-stocktake-delete],[data-ref-delete],#resetAppBtn,#restoreDataBtn,#backupDataBtn";
 function blockUnavailableNormalizedAction(target){
   if(persistenceMode==="legacy"||!target.closest(NORMALIZED_UNAVAILABLE_ACTIONS))return false;
   toast("Fitur ini sementara tidak tersedia dalam mode normalized. Tidak ada data yang diubah atau diekspor; gunakan prosedur administrasi database yang ditinjau.");return true;
@@ -1131,6 +1180,8 @@ function saveTransaction(action="save"){
 }
 
 function renderTransactions(){
+  // The legacy export policy is retained; normalized history exports require admin.
+  $("#exportTransactionsBtn").classList.toggle("hidden",persistenceMode!=="legacy"&&!hasPermission("backup"));
   fillSelect($("#transactionPaymentFilter"),state.paymentMethods,x=>x,x=>x,true,"Semua Metode Bayar");
   const q=$("#transactionSearch").value.toLowerCase(), date=$("#transactionDateFilter").value, payment=$("#transactionPaymentFilter").value;
   const rows=state.transactions.filter(t=>(t.invoice+" "+t.customer).toLowerCase().includes(q)&&(!date||transactionBusinessDate(t)===date)&&(!payment||t.paymentMethod===payment));
@@ -1490,8 +1541,14 @@ document.addEventListener("click",async e=>{
   if(e.target.id==="exportProductsBtn"&&requirePermission("products-manage"))csvDownload("daftar-produk.csv",["Nama Produk","Kategori","Satuan","Harga Modal","Harga Satuan","Harga Grosir","Stok"],state.products.map(p=>[p.name,p.category,p.unit,p.costPrice,p.retailPrice,p.wholesalePrice,p.stock]));
   if(e.target.id==="exportSuppliersBtn")csvDownload("daftar-supplier.csv",["Nama","Alamat","Telepon","Email","Keterangan"],state.suppliers.map(x=>[x.name,x.address,x.phone,x.email,x.note]));
   if(e.target.id==="exportCustomersBtn")csvDownload("daftar-pelanggan.csv",["Nama","Alamat","Telepon","Email","Keterangan"],state.customers.map(x=>[x.name,x.address,x.phone,x.email,x.note]));
-  if(e.target.id==="exportIncomingBtn")csvDownload("barang-masuk.csv",["Tanggal","Supplier","Produk","Kategori","Satuan","Harga Beli","Jumlah","Total"],state.incoming.map(x=>[x.date,x.supplier,x.product,x.category,x.unit,x.purchasePrice,x.qty,x.total]));
-  if(e.target.id==="exportTransactionsBtn")csvDownload("transaksi-keluar.csv",["No Transaksi","Tanggal","Kasir","Pelanggan","Metode","Subtotal","Diskon","Pajak","Total","Total Dibayar","Kembali","DP","Sisa","Status"],state.transactions.map(x=>[x.invoice,x.createdAt,x.cashier,x.customer,x.paymentMethod,x.subtotal,x.discountAmount,x.taxAmount,x.total,getTransactionPaidTotal(x),x.change,x.downPayment,x.remaining,x.paymentStatus]));
+  if(e.target.id==="exportIncomingBtn"){
+    if(persistenceMode!=="legacy")exportCompleteNormalizedHistory("incoming");
+    else csvDownload("barang-masuk.csv",["Tanggal","Supplier","Produk","Kategori","Satuan","Harga Beli","Jumlah","Total"],state.incoming.map(x=>[x.date,x.supplier,x.product,x.category,x.unit,x.purchasePrice,x.qty,x.total]));
+  }
+  if(e.target.id==="exportTransactionsBtn"){
+    if(persistenceMode!=="legacy")exportCompleteNormalizedHistory("transactions");
+    else csvDownload("transaksi-keluar.csv",["No Transaksi","Tanggal","Kasir","Pelanggan","Metode","Subtotal","Diskon","Pajak","Total","Total Dibayar","Kembali","DP","Sisa","Status"],state.transactions.map(x=>[x.invoice,x.createdAt,x.cashier,x.customer,x.paymentMethod,x.subtotal,x.discountAmount,x.taxAmount,x.total,getTransactionPaidTotal(x),x.change,x.downPayment,x.remaining,x.paymentStatus]));
+  }
 });
 document.addEventListener("keydown",e=>{
   if(e.key==="Enter"&&e.target.id==="printInvoiceSearch"){

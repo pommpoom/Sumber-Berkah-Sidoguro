@@ -389,7 +389,7 @@ test('normalized cashier and read-only preference changes are explicit no-ops',(
 test('legacy print preferences retain existing whole-state save behavior',()=>{
  const b=browser();b.run('let preferenceSaves=0;saveState=()=>preferenceSaves++;savePrintPreference("printReceiptType","Invoice A4");savePrintPreference("printMethod","Tidak Mencetak")');assert.equal(b.run('preferenceSaves'),2);assert.equal(b.run('state.settings.receiptType'),'Invoice A4');assert.equal(b.run('state.settings.printMethod'),'Tidak Mencetak');
 });
-for(const mode of ['normalized','normalized-read'])for(const selector of ['[data-tx-delete]','[data-incoming-delete]','[data-stocktake-delete]','[data-product-delete]','[data-supplier-delete]','[data-customer-delete]','[data-ref-delete]','#resetAppBtn','#restoreDataBtn','#backupDataBtn','#exportIncomingBtn','#exportTransactionsBtn'])test(`${mode} blocks ${selector} before any side effect`,async()=>{
+for(const mode of ['normalized','normalized-read'])for(const selector of ['[data-tx-delete]','[data-incoming-delete]','[data-stocktake-delete]','[data-product-delete]','[data-supplier-delete]','[data-customer-delete]','[data-ref-delete]','#resetAppBtn','#restoreDataBtn','#backupDataBtn'])test(`${mode} blocks ${selector} before any side effect`,async()=>{
  const b=browser(),handlers=installActionListeners(b);b.run(`persistenceMode="${mode}";saveState=()=>{throw new Error("Unexpected save")};csvDownload=()=>{throw new Error("Unexpected export")}`);b.context.confirm=()=>{throw new Error('Unexpected confirmation')};const before=b.run('JSON.stringify(state)'),draft=b.run('JSON.stringify(cart)');let prevented=false;
  await handlers.click({target:actionTarget(selector),preventDefault(){prevented=true}});assert.equal(prevented,true);assert.equal(b.run('JSON.stringify(state)'),before);assert.equal(b.run('JSON.stringify(cart)'),draft);assert.equal(b.requests.length,0);assert.match(b.messages[0],/sementara tidak tersedia/);assert.equal(b.storage.size,0);
 });
@@ -408,4 +408,46 @@ test('print preference adopts server-confirmed configuration rather than submitt
 });
 test('incomplete configuration acknowledgement retains pending command without success',async()=>{
  const b=browser();b.run('persistenceMode="normalized"');const before=b.run('JSON.stringify(state.settings)');b.replies.push(reply({version:2,record:{}}));b.run('savePrintPreference("printReceiptType","Invoice A4")');await settle();assert.equal(b.run('JSON.stringify(state.settings)'),before);assert.equal(b.storage.size,1);assert.match(b.node('#saveStatus span').textContent,/Konfirmasi pengaturan tidak lengkap/);assert.equal(b.messages.length,0);
+});
+
+// Complete-history CSV regression: all pages must belong to one revision.
+test('normalized admin exports complete transactions across bounded pages',async()=>{
+ const b=browser();b.run('persistenceMode="normalized";let exported=null;csvDownload=(filename,headers,rows)=>{exported={filename,rows}}');
+ const first=Array.from({length:100},(_,i)=>({invoice:String(i+1),createdAt:'2026-11-19',customer:'-',cashier:'ADMIN',paymentMethod:'Tunai',total:100,cashIn:100}));
+ const last=[{invoice:'101',createdAt:'2026-11-19',customer:'-',cashier:'ADMIN',paymentMethod:'Tunai',total:100,cashIn:100}];
+ b.replies.push(reply({rows:first,total:101}),reply({rows:last,total:101}),reply({version:1}));
+ await b.run('exportCompleteNormalizedHistory("transactions")');
+ const e=JSON.parse(b.run('JSON.stringify(exported)'));
+ assert.equal(e.rows.length,101);assert.equal(e.rows[100][0],'101');
+ assert.match(e.filename,/transaksi-keluar-lengkap/);
+ assert.equal(b.requests.length,3);
+ assert.match(b.requests[0].url,/page=1&limit=100&expectedRevision=1/);
+ assert.match(b.requests[1].url,/page=2&limit=100&expectedRevision=1/);
+ assert.ok(b.requests[2].url.endsWith('/api/sync'));
+});
+test('normalized export cancels on pagination revision conflict',async()=>{
+ const b=browser();b.run('persistenceMode="normalized";let exported=0;csvDownload=()=>exported++');
+ b.replies.push(reply({rows:Array.from({length:100},(_,i)=>({invoice:String(i+1)})),total:101}),reply({message:'Read revision changed'},409));
+ await b.run('exportCompleteNormalizedHistory("transactions")');
+ assert.equal(b.run('exported'),0);assert.match(b.messages.at(-1),/Ekspor dibatalkan/);
+});
+test('normalized export cancels when final sync revision changed',async()=>{
+ const b=browser();b.run('persistenceMode="normalized";let exported=0;csvDownload=()=>exported++');
+ b.replies.push(reply({rows:[{invoice:'1'}],total:1}),reply({version:2}));
+ await b.run('exportCompleteNormalizedHistory("transactions")');
+ assert.equal(b.run('exported'),0);assert.match(b.messages.at(-1),/Ekspor dibatalkan/);
+});
+test('normalized cashier cannot export history',async()=>{
+ const b=browser();b.run('persistenceMode="normalized";sessionUser.level="KASIR";let exported=0;csvDownload=()=>exported++');
+ await b.run('exportCompleteNormalizedHistory("transactions")');
+ assert.equal(b.run('exported'),0);assert.equal(b.requests.length,0);
+ assert.match(b.messages.at(-1),/ADMINISTRATOR/);
+});
+test('normalized admin exports complete incoming history',async()=>{
+ const b=browser();b.run('persistenceMode="normalized";let exported=null;csvDownload=(filename,headers,rows)=>{exported={filename,rows}}');
+ b.replies.push(reply({rows:[{id:'i1',date:'2026-11-19',supplier:'S',product:'P',qty:1,total:10}],total:1}),reply({version:1}));
+ await b.run('exportCompleteNormalizedHistory("incoming")');
+ const e=JSON.parse(b.run('JSON.stringify(exported)'));
+ assert.equal(e.rows.length,1);assert.match(e.filename,/barang-masuk-lengkap/);
+ assert.match(b.requests[0].url,/api\/incoming\?/);
 });
