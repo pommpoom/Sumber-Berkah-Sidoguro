@@ -739,6 +739,12 @@ function renderSettings(){
 }
 
 function renderDashboard(){
+  for(const [selector,permission] of [['[data-page="incoming"]','incoming'],['[data-dashboard-add-product]','products-manage'],['[data-page="stocktake"]','stocktake']]){
+    const button=$(`#dashboardPage .dashboard-quick-actions ${selector}`);
+    if(button)button.classList.toggle('hidden',!hasPermission(permission));
+  }
+  const chartSubtitle=$("#dashboardPage .dashboard-chart-widget header span");
+  if(chartSubtitle)chartSubtitle.textContent=hasPermission('dashboard-profit')?'Penjualan dan laba kotor':'Penjualan';
   if(!$("#dashboardDate").value)$("#dashboardDate").value=today();const selectedDate=$("#dashboardDate").value;
   const aggregate=persistenceMode!=="legacy"?normalizedDashboard:null;
   if(persistenceMode!=="legacy"&&!aggregate)return;
@@ -844,6 +850,12 @@ function userModal(id=null){
 
 function renderProducts(){
   const isAdmin=hasPermission("products-manage");
+  $("#addProductBtn").classList.toggle("hidden",!isAdmin);
+  $("#exportProductsBtn").classList.toggle("hidden",!isAdmin);
+  for(const index of [5,10]){
+    const header=$(`#productsPage .products-table thead th:nth-child(${index})`);
+    if(header)header.classList.toggle("hidden",!isAdmin);
+  }
   fillSelect($("#productCategoryFilter"),state.categories,x=>x,x=>x,true,"Semua Kategori");
   const q=$("#productSearch").value.toLowerCase(),category=$("#productCategoryFilter").value,stockFilter=$("#productStockFilter").value;
   const rows=state.products.filter(p=>(p.name.toLowerCase().includes(q)||p.category.toLowerCase().includes(q))&&(!category||p.category===category)&&(!stockFilter||(stockFilter==="empty"?Number(p.stock)<=0:stockFilter==="low"?Number(p.stock)>0&&Number(p.stock)<=Number(p.minStock||0):Number(p.stock)>Number(p.minStock||0))));
@@ -856,8 +868,8 @@ function renderProducts(){
   $("#productSummary").innerHTML=`<article><div><small>Total Record</small><strong>${rows.length}</strong><p>Produk terdaftar</p></div></article>${isAdmin?`<article><div><small>Total Harga Modal</small><strong>${rupiah(cost)}</strong><p>Total seluruh modal</p></div></article>`:""}<article><div><small>Harga Jual Satuan</small><strong>${rupiah(retail)}</strong><p>Total harga jual satuan</p></div></article><article><div><small>Harga Jual Grosir</small><strong>${rupiah(wholesale)}</strong><p>Total harga jual grosir</p></div></article><article><div><small>Total Stok</small><strong>${money(stock)}</strong><p>Total seluruh stok</p></div></article>${isAdmin?`<article><div><small>Nilai Modal Stok</small><strong>${rupiah(stockValue)}</strong><p>Total nilai modal stok</p></div></article>`:""}`;
   $("#productTableBody").innerHTML=pagedRows.length?pagedRows.map(p=>`<tr>
     <td>${esc(p.name)}</td><td>${esc(p.category)}</td><td>${esc(p.unit)}</td><td>${p.trackStock?"YA":"TIDAK"}</td>
-    <td class="money">${isAdmin?money(p.costPrice):"-"}</td><td class="money">${money(p.retailPrice)}</td><td class="money">${money(p.wholesalePrice)}</td>
-    <td class="money">${money(p.discount)}</td><td class="money"><span class="product-stock ${p.stock<=0?"empty":p.stock<=p.minStock?"low":""}">${money(p.stock)}</span></td><td class="money">${money(p.costPrice*p.stock)}</td>
+    <td class="money ${isAdmin?"":"hidden"}">${isAdmin?money(p.costPrice):""}</td><td class="money">${money(p.retailPrice)}</td><td class="money">${money(p.wholesalePrice)}</td>
+    <td class="money">${money(p.discount)}</td><td class="money"><span class="product-stock ${p.stock<=0?"empty":p.stock<=p.minStock?"low":""}">${money(p.stock)}</span></td><td class="money ${isAdmin?"":"hidden"}">${isAdmin?money(p.costPrice*p.stock):""}</td>
     <td>${isAdmin?`<button class="mini-btn edit" data-product-edit="${p.id}">Edit</button> <button class="mini-btn delete" data-product-delete="${p.id}">Hapus</button>`:"-"}</td>
   </tr>`).join(""):`<tr><td colspan="11" class="empty-table">Produk tidak ditemukan.</td></tr>`;
   const visible=[];for(let p=1;p<=pageCount;p++){if(p===1||p===pageCount||Math.abs(p-productPage)<=1)visible.push(p)}let last=0,buttons=[];for(const p of visible){if(p-last>1)buttons.push(`<span>…</span>`);buttons.push(`<button class="${p===productPage?"active":""}" data-product-page="${p}">${p}</button>`);last=p}$("#productPagination").innerHTML=`<button data-product-page="${productPage-1}" ${productPage===1?"disabled":""}>‹</button>${buttons.join("")}<button data-product-page="${productPage+1}" ${productPage===pageCount?"disabled":""}>›</button>`;
@@ -1475,7 +1487,7 @@ document.addEventListener("click",async e=>{
   const st=e.target.closest("[data-stocktake-delete]");if(st&&requirePermission("stocktake")&&confirm("Hapus riwayat stok opname? Stok saat ini tidak diubah.")){state.stocktakes=state.stocktakes.filter(x=>x.id!==st.dataset.stocktakeDelete);saveState();renderAll();}
   const it=e.target.closest("[data-incoming-tab]");if(it){$$("[data-incoming-tab]").forEach(b=>b.classList.toggle("active",b===it));$("#incomingInput").classList.toggle("hidden",it.dataset.incomingTab!=="input");$("#incomingList").classList.toggle("hidden",it.dataset.incomingTab!=="list");}
   const ss=e.target.closest("[data-stock-tab]");if(ss){$$("[data-stock-tab]").forEach(b=>b.classList.toggle("active",b===ss));$("#stockInput").classList.toggle("hidden",ss.dataset.stockTab!=="input");$("#stockList").classList.toggle("hidden",ss.dataset.stockTab!=="list");}
-  if(e.target.id==="exportProductsBtn")csvDownload("daftar-produk.csv",["Nama Produk","Kategori","Satuan","Harga Modal","Harga Satuan","Harga Grosir","Stok"],state.products.map(p=>[p.name,p.category,p.unit,p.costPrice,p.retailPrice,p.wholesalePrice,p.stock]));
+  if(e.target.id==="exportProductsBtn"&&requirePermission("products-manage"))csvDownload("daftar-produk.csv",["Nama Produk","Kategori","Satuan","Harga Modal","Harga Satuan","Harga Grosir","Stok"],state.products.map(p=>[p.name,p.category,p.unit,p.costPrice,p.retailPrice,p.wholesalePrice,p.stock]));
   if(e.target.id==="exportSuppliersBtn")csvDownload("daftar-supplier.csv",["Nama","Alamat","Telepon","Email","Keterangan"],state.suppliers.map(x=>[x.name,x.address,x.phone,x.email,x.note]));
   if(e.target.id==="exportCustomersBtn")csvDownload("daftar-pelanggan.csv",["Nama","Alamat","Telepon","Email","Keterangan"],state.customers.map(x=>[x.name,x.address,x.phone,x.email,x.note]));
   if(e.target.id==="exportIncomingBtn")csvDownload("barang-masuk.csv",["Tanggal","Supplier","Produk","Kategori","Satuan","Harga Beli","Jumlah","Total"],state.incoming.map(x=>[x.date,x.supplier,x.product,x.category,x.unit,x.purchasePrice,x.qty,x.total]));
