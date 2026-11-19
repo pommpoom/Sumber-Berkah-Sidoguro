@@ -86,3 +86,5 @@ GRANT EXECUTE ON FUNCTION public.save_app_state(BIGINT, JSONB, VARCHAR) TO servi
 ALTER TABLE public.app_users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.app_state ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON TABLE public.app_users, public.app_state FROM anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.app_users TO service_role;
+GRANT SELECT ON TABLE public.app_state TO service_role;
